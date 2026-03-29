@@ -1,0 +1,183 @@
+# Stop Loss
+
+Stop Loss limits position losses by automatically closing it when price moves in unfavorable direction. Settings are identical for all algorithms (Shots, Depth Shots, Averages, Vector, Signal) and manual trading.
+
+⚠️ **When trading with leverage:** always configure liquidation offset (see section below).
+
+***
+
+### Main Settings
+
+#### Enable Stop Loss
+
+Function is enabled by default. Uncheck to open positions without protection.
+
+#### Percentage
+
+How far from entry price to place Stop Loss.
+
+**How it works:**
+
+* Value is always positive (example: 2%)
+* For long (buy) — Stop Loss placed **below** entry price
+* For short (sell) — Stop Loss placed **above** entry price
+
+**Example:** opened long at 100 USDT, percentage 2% → Stop Loss at 98 USDT
+
+***
+
+#### Spread
+
+Additional offset for limit orders that guarantees execution during sharp price movements.
+
+⚠️ **Applied only** for limit and stop-limit types. Market orders ignore this parameter.
+
+**Why needed:**
+
+When price sharply drops through Stop Loss level, limit order can "get stuck" and not execute. Spread shifts order deeper into order book, ensuring position close.
+
+**How it works:**
+
+When Stop Loss level is touched, spread is added to price. If price continues falling — spread is added again every 60 ms until order executes.
+
+**Example:**
+
+* Stop Loss at 98 USDT, spread 0.5%
+* Price dropped to 98 — order placed at 97.51 USDT (98 - 0.5%)
+* Price continued falling — another 0.5% added from current price
+
+***
+
+#### Delay
+
+Time in seconds between position opening and Stop Loss placement. During this period position is not protected.
+
+**When useful:**
+
+Allows waiting out short-term movement against you right after entry. If price quickly returns — position stays open.
+
+**Usage example:**
+
+When trading Shots/Depth Shots, delay of 1-2 seconds gives chance to close position in profit on pullback, instead of immediate Stop Loss inside same breakthrough.
+
+Fractional values allowed (example: 0.5).
+
+***
+
+#### Order Type
+
+**Limit** — virtual order in MoonTrader core. Becomes real limit when price touches. Uses spread.
+
+**Market** — virtual order in core. Becomes real market when price touches. Closes position immediately at market price.
+
+**Stop Limit** — real order on exchange. Places limit order when trigger touches. Uses spread.
+
+⚠️ **Important:** stop-limit order availability depends on exchange.
+
+***
+
+#### Virtual and Real Orders
+
+**Virtual order (v):**
+
+* Exists only in MoonTrader core
+* Sent to exchange when conditions met
+* Marked with purple "v"
+
+**Real order (r):**
+
+* Placed on exchange from creation
+* Visible in order book
+* Marked with green "r"
+
+⚠️ **Rule:** from Take Profit and Stop Loss pair, one must be virtual, other — real.
+
+***
+
+### Liquidation Offset
+
+Protects against forced position liquidation by exchange when trading with leverage.
+
+#### Offset Distance
+
+Offset in percent from liquidation price.
+
+**How it works:**
+
+When opening position, MoonTrader compares liquidation price (calculated by exchange) with your Stop Loss.
+
+If liquidation is closer to current price than Stop Loss — Stop Loss automatically moves before liquidation price with set offset.
+
+**Formula:** Stop Loss = Liquidation price - Offset
+
+**Example:**
+
+Your Stop Loss: 105 USDT
+
+Liquidation price: 100 USDT
+
+Offset: 0.1%
+
+**Without offset:** position liquidates at 100, Stop Loss at 105 doesn't trigger ❌
+
+**With offset:** Stop Loss moves to 99.9 (100 - 0.1%), triggers before liquidation ✅
+
+***
+
+### Trailing Stop
+
+Allows Stop Loss to automatically follow price in profitable direction, protecting accumulated profit.
+
+**How it works:**
+
+When price moves in profitable direction by spread amount, Stop Loss also moves by that amount. On price reversal, Stop Loss stays in place.
+
+**Example:**
+
+"Buy" position at 100 USDT, Stop Loss 2%, trailing spread 1%
+
+* Price 101 (+1%) → Stop Loss moves from 98 to 99
+* Price 102 (+1%) → Stop Loss moves from 99 to 100 (breakeven)
+* Price 103 (+1%) → Stop Loss moves from 100 to 101 (profit locked)
+
+#### Spread
+
+How much price must move in profitable direction for Stop Loss to move by same amount.
+
+***
+
+### Second Stop-Loss
+
+Allows replacing initial Stop Loss with new one with different parameters when price reaches certain profit level.
+
+#### Trigger Distance
+
+How much percent price must rise from entry point for first Stop Loss to cancel and second to place.
+
+If trigger not reached, first Stop Loss works.
+
+***
+
+#### Percentage
+
+Distance from current price in percent where second Stop Loss will be placed when trigger fires.
+
+**Formula:** Second Stop Loss = Trigger - Percentage
+
+**Examples:**
+
+* Trigger 2%, Percentage 2% → second Stop Loss at entry price (breakeven)
+* Trigger 3%, Percentage 2% → second Stop Loss at +1% from entry (profit locked)
+
+***
+
+#### Trailing and Spread
+
+Work same as for regular trailing, but apply only to second Stop Loss.
+
+***
+
+### Support
+
+If you have questions about Stop Loss setup or want to suggest improvements, contact [support](https://t.me/moontrader_support_en).
+

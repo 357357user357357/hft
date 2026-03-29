@@ -1,0 +1,22 @@
+# LLM Agent Dependencies for TradingAgents-style HFT
+
+# Core LLM clients
+openai>=1.0.0          # vLLM + OpenAI API compatible clients
+anthropic>=0.18.0      # Claude API
+ollama>=0.1.0          # Local Ollama inference
+
+# vLLM for local GPU serving (2×3090)
+# Install only when renting GPUs: pip install vllm
+# vllm>=0.4.0
+
+# Data fetching (optional, for news/sentiment sources)
+# tweepy>=4.0.0        # Twitter/X API
+# praw>=7.0.0          # Reddit API
+# yfinance>=0.2.0      # Yahoo Finance for fundamentals
+
+# Testing
+pytest>=7.0.0
+
+# Existing HFT deps (already in your repo)
+# networkx / rustworkx
+# gudhi

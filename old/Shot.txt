@@ -1,0 +1,313 @@
+# Shot Algorithm
+
+Shots profits from sharp price spikes (breakthroughs) followed by pullbacks. The algorithm keeps an order at a set distance from the price, automatically moving it during smooth movements. When a breakthrough occurs, the position opens and quickly closes on the pullback.
+
+***
+
+### How It Works
+
+1. **Order Placement**
+   * "Buy" order is placed below the current price
+   * "Sell" order is placed above the current price
+   * Distance is set in the "Distance" parameter
+2. **Buffer (Dead Zone)**
+
+   A corridor is created around the current price. While the price stays inside, the order doesn't move.
+3. **Automatic Movement**
+   * Price moved away from the order (far boundary) → order moves closer to price
+   * Price approached the order (near boundary) → order moves further away
+4. **Execution on Breakthrough**
+
+   Sharp price spike toward the order → position opens.
+5. **Position Protection**
+
+   Take Profit (profit lock) and Stop Loss (loss limit) are set automatically.
+
+***
+
+### Main Parameters
+
+#### Distance
+
+How far from the current price to keep the order (in percent).
+
+**Recommendations:**
+
+* High-liquidity markets: 0.5–1%
+* Low-liquidity markets: 1.5–3%
+
+⚠️ **Important:** negative distance will open a position immediately at market price.
+
+***
+
+#### Buffer
+
+Width of the corridor in percent within which price can fluctuate without moving the order.
+
+**How it works:**
+
+With a 0.4% buffer, current price is in the center:
+
+* upper boundary: +0.2% from price
+* lower boundary: -0.2% from price
+
+Price crossed the boundary → order moved → buffer recenters.
+
+**Size Selection:**
+
+* Small buffer (0.2–0.4%) — precise price tracking, high load
+* Large buffer (from 0.8%) — less load, lower precision
+
+***
+
+#### Follow Price Delay
+
+Number of seconds during which the order will not move toward price after crossing the far buffer boundary.
+
+**How it works:**
+
+1. Price crosses far buffer boundary — delay timer starts
+2. For N seconds, order doesn't move toward price, even if price continues moving away
+3. If price reverses and returns to buffer during delay — order doesn't move
+4. If price crosses buffer in opposite direction during delay (approaches order) — order moves immediately without delay
+
+**Why needed:**
+
+* Protects against false breakouts and frequent replacements during volatility
+* Reduces exchange API load
+* Prevents following short-term fluctuations
+
+**Benefits of small values (0.1–1 sec):**
+
+* Maximum precision in price tracking
+* Fast adaptation to market movements
+* Minimal risk of delayed replacement
+* Predictable algorithm behavior
+
+**Drawbacks of large values (5+ sec):**
+
+* Orders stay at outdated prices too long
+* Algorithm lags behind market movements
+* Sudden and unexpected replacements after timer expires
+* Reduced overall trading efficiency
+
+⚠️ **Important:** use algorithm profiling to see buffer crossing moments and timer activations.
+
+**Default:** recommended to use minimum values for precise algorithm operation.
+
+***
+
+#### Replace Delay
+
+Number of seconds during which the order will not move away from price after it crosses the near buffer boundary.
+
+**How it works:**
+
+1. Price crosses near buffer boundary — delay timer starts
+2. For N seconds, order doesn't move away from price, even if price continues approaching
+3. If price reverses and returns to buffer during delay — order doesn't move
+4. If price crosses buffer in opposite direction during delay (moves away from order) — order moves immediately without delay
+
+**Why needed:**
+
+* Protects against triggers during rapid movements without subsequent pullback
+* Reduces unnecessary order executions
+* Optimizes operation on markets with sharp reverse impulses
+
+**Benefits of small values (0.1–1 sec):**
+
+* Orders don't hang at irrelevant prices
+* Logic matches current market state
+* Less risk of opening position at unfavorable point
+* Algorithm works smoothly and predictably
+
+**Drawbacks of large values (5+ sec):**
+
+* Buffer stays motionless too long
+* Possible false triggers after sharp reversal
+* Harder to analyze and debug algorithm behavior
+* Unpredictable replacements after timer expires
+
+⚠️ **Important:** small values give maximum precision but increase number of replacements. This is normal for dynamic algorithms, but consider exchange API load.
+
+**Default:** recommended to use minimum values for precise algorithm operation.
+
+***
+
+#### Data Source
+
+Where to get last price data for calculating distance and buffer.
+
+**Ticker Price:**
+
+* Updates less frequently
+* Lower core load
+* For higher distances
+* When trading large number of orders
+
+**Trades Data:**
+
+* Updates several times more frequently
+* Higher load
+* For small distances
+* More accurate and faster response
+
+Choose the data source based on your needs and goals. Many traders use trades even at high distances during strong volatility.
+
+⚠️ **Important:** this parameter only affects distance and buffer calculation. Data for filters (mark price, volumes, delta filters) is taken from "Market Overview" → update settings in "Settings → Core → Market Overview → Data Source".
+
+**Default:** Ticker Price
+
+***
+
+### Order Parameters
+
+#### Side
+
+**Buy (Long):**
+
+* Order in Bid book (buy side)
+* Opens at low price, closes at high
+* Expects upward pullback
+
+**Sell (Short):**
+
+* Order in Ask book (sell side)
+* Opens at high price, closes at low
+* Expects downward pullback
+
+***
+
+#### Client Order Type
+
+What type of order to place.
+
+***
+
+#### Stop Price
+
+Stop price value for "Stop Limit" type.
+
+***
+
+#### Order Size
+
+Order size in USDT. When trading with leverage, specify the full size including leverage.
+
+⚠️ **Important:** size must meet exchange requirements for all selected pairs.
+
+**Auto-increase button:** automatically raises size to exchange minimum only for pairs where it's below required.
+
+Current minimums are available on the "Management" tab.
+
+***
+
+#### Iceberg
+
+Hides the true order size from the order book. Order executes in parts.
+
+⚠️ **Important:** works only on spot.
+
+***
+
+#### Auto Join
+
+Automatically merges multiple positions on the same pair:
+
+* Recalculates weighted average entry price
+* Adjusts Take Profit and Stop Loss
+
+**What merges:**
+
+* Positions from all algorithms with Auto Join enabled without key
+* Manual positions
+
+⚠️ **Recommendation:** always use join key to avoid unwanted merging.
+
+***
+
+#### Join Key
+
+Unique name for merging positions only between selected algorithms.
+
+**Example:** trading BTCUSDT with three algorithms:
+
+* Shots with key "aggressive"
+* Shots Group with key "aggressive"
+* Vector with key "trend"
+
+The first two will merge with each other, Vector stays independent.
+
+⚠️ **Important:** algorithm with Auto Join without key can merge with any other positions, even keyed ones.
+
+***
+
+### Take Profit
+
+Automatic profit lock. Enabled by default.
+
+#### Percentage
+
+Distance from entry price in percent:
+
+* For long — above entry price
+* For short — below entry price
+
+⚠️ **Important:** percentage must cover exchange commission for the entire trade, otherwise there will be no profit.
+
+***
+
+#### Order Type
+
+**Limit (recommended):**
+
+* Real order on exchange (r)
+* Visible in order book
+* Works with virtual Stop Loss
+
+**Market:**
+
+* Virtual order in core (v)
+* Becomes real when price touches
+* Works with real stop-limit Stop Loss
+
+⚠️ **Important:** availability depends on the exchange.
+
+***
+
+#### Iceberg
+
+Hides Take Profit size from the order book. Independent from main order iceberg setting.
+
+⚠️ **Important:** works only on spot.
+
+***
+
+#### Auto Price Down
+
+Gradually lowers the Take Profit order if price doesn't reach the initial level.
+
+**Timer:** how many seconds until the next lowering step
+
+**Step:** how much percent from entry price to lower Take Profit
+
+**Limit:** minimum Take Profit level, below which not to go
+
+**Example:**
+
+Settings: Take Profit 1.5%, timer 1 sec, step 0.5%, limit 0.2%
+
+1. Position opened → Take Profit at 1.5%
+2. After 1 sec → 1%
+3. After 1 sec → 0.5%
+4. After 1 sec → 0.2% (minimum)
+5. Stays at 0.2% until closed
+
+⚠️ **Important:** profit increase is not provided.
+
+***
+
+### Support
+
+Questions about setup or suggestions — contact [support](https://t.me/moontrader_support_en).
+

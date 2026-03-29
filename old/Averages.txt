@@ -1,0 +1,439 @@
+# Averages Algorithm
+
+Averages profits from corrections — when price temporarily moves against the main trend, then returns back. The algorithm compares average price across two timeframes (long and short) and places orders when the difference falls within a set range.
+
+***
+
+### How It Works
+
+1. **Calculating Average Prices**
+
+   Continuously calculates average price for two periods (for example: 1 minute and 10 seconds).
+2. **Calculating Divergence**
+
+   Subtracts short average from long average and converts to percent (delta).
+
+   * Positive delta — short-term downtrend
+   * Negative delta — short-term uptrend
+3. **Signal (Trigger)**
+
+   When delta falls within set range — orders are placed.
+4. **Orders Stay in Place**
+
+   After placement, orders don't move until execution or cancellation.
+5. **Position Protection**
+
+   After execution, Take Profit and Stop Loss are set automatically.
+
+***
+
+### Main Parameters
+
+#### Order Price Distance
+
+How far from trigger price to place the order (in percent).
+
+⚠️ **Important:** sign is always from trigger price, regardless of direction:
+
+* **Positive** — order above price
+* **Negative** — order below price
+
+**Examples:**
+
+| Distance | Side | Result                 |
+| -------- | ---- | ---------------------- |
+| +1%      | Sell | Sell order above price |
+| -1%      | Buy  | Buy order below price  |
+| +1%      | Buy  | Instant market buy\*   |
+| -1%      | Sell | Instant market sell\*  |
+
+* Market order opens position immediately
+
+***
+
+#### Period (Long-Short)
+
+Period for calculating long-term average price (from 1 second to 24 hours).
+
+**Recommendations:**
+
+* Scalping: 30 sec – 2 min
+* Short-term trading: 5–15 min
+* Medium-term trading: 1–4 hours
+
+**Default:** 1 minute
+
+***
+
+#### Period (Short)
+
+Period for calculating short-term average price (from 1 second to 24 hours).
+
+**Recommendations:**
+
+* Short period 3–10 times smaller than long
+* Optimal for start: long 1 min, short 10 sec
+
+⚠️ **Important:** if short period is greater than long, delta sign inverts.
+
+**Default:** 10 seconds
+
+***
+
+#### Trigger Range
+
+At what divergence of average prices to place orders (in percent).
+
+Specify minimum and maximum. Values can be positive, negative, fractional.
+
+⚠️ **Important:** specify from smaller to larger, otherwise range will be empty.
+
+**Examples:**
+
+**Downward correction against growth (buy on dip):**
+
+* Periods: 1 min / 10 sec
+* Range: from -0.5% to -0.1%
+* Side: Buy
+
+Short-term price 0.1–0.5% above long-term → buy.
+
+**Upward correction against decline (sell on rally):**
+
+* Periods: 1 min / 10 sec
+* Range: from 0.1% to 0.5%
+* Side: Sell
+
+Short-term price 0.1–0.5% below long-term → sell.
+
+**Any divergence:**
+
+* Range: from 0% to 0%
+
+Orders placed at any delta.
+
+***
+
+#### Add Parameter
+
+Creating additional sets of periods with ranges.
+
+All parameters work with **"AND"** logic — order is placed only when conditions of **all** parameters are met simultaneously.
+
+**Example (multi-timeframe analysis):**
+
+**Parameter 1:** 10 sec vs 1 min, range -0.3% to -0.1%
+
+**Parameter 2:** 1 min vs 5 min, range 0.1% to 0.5%
+
+Order is placed only when both conditions are met simultaneously.
+
+***
+
+### Order Parameters
+
+#### Side
+
+**Buy (Long):**
+
+* Order in Bid book
+* Opens low, closes high
+* Expects growth
+
+**Sell (Short):**
+
+* Order in Ask book
+* Opens high, closes low
+* Expects decline
+
+⚠️ Final behavior depends on distance sign.
+
+***
+
+#### Client Order Type / Stop Price
+
+What type of order to place and stop price value for stop-limit.
+
+***
+
+#### Order Size
+
+Size in USDT. When trading with leverage, specify full size including leverage.
+
+**Auto-increase button:** raises size to exchange minimum for pairs where it's below required.
+
+Minimums available on "Management" tab.
+
+***
+
+#### Iceberg
+
+Hides order size from the order book. Executes in parts.
+
+⚠️ **Important:** works only on spot.
+
+***
+
+#### Cancel on First Deal
+
+Cancels entire multi-order grid when first position closes (Take Profit or Stop Loss).
+
+**When to enable:**
+
+* ✅ Want to lock profit and not average down
+* ❌ Ready to average down on further movement
+
+***
+
+#### Join on First Fill
+
+Automatically merges positions on the same pair:
+
+* Recalculates weighted average entry price
+* Adjusts Take Profit and Stop Loss
+
+If disabled — each position exists separately.
+
+⚠️ **Important:** without join key, merges **all** positions on pair, including manual ones.
+
+***
+
+#### Join Key
+
+Unique name for merging positions only between selected algorithms.
+
+**Example:** BTCUSDT, three algorithms:
+
+* Averages with key "main"
+* Averages Group with key "main"
+* Vector with key "trend"
+
+First two merge with each other, Vector works independently.
+
+⚠️ **Important:** algorithm without key can merge with any positions.
+
+***
+
+#### Limit Position Size
+
+Maximum total volume of orders and positions of this algorithm for each trading pair in USDT.
+
+When limit is reached on specific pair, new orders are not placed on this pair. Algorithm continues working on other pairs.
+
+⚠️ **Important:** limit applies to each pair separately. If limit is 100 USDT and algorithm has 15 pairs, total volume can reach 1,500 USDT (100 × 15).
+
+⚠️ Only orders from **this** algorithm are counted, other algorithms and manual positions are not counted.
+
+***
+
+#### Use Cancel Delay
+
+Automatic cancellation of unfilled orders after set time (in seconds).
+
+**Recommendations:**
+
+* Fast strategies: 10–60 sec
+* Moderate strategies: 60–300 sec
+* Patient strategies: disable
+
+***
+
+#### Do Not Cancel If Executed
+
+Extends grid lifetime when first order executes.
+
+**Enabled:** if one order executed — others remain active
+
+**Disabled:** all unfilled orders are cancelled after time expires
+
+⚠️ "Cancel on First Deal" parameter has priority.
+
+***
+
+### Multiple Orders
+
+Grid of additional orders for averaging entry price during deep corrections.
+
+#### Relative To
+
+What to use for calculating each next order size.
+
+**First:**
+
+* 1st size: 100 USDT, increase 100%
+* Grid: 100, 200, 300, 400 USDT
+* Formula: Size(n) = Size(1) × (1 + (n-1) × %)
+
+**Previous:**
+
+* 1st size: 100 USDT, increase 100%
+* Grid: 100, 200, 400, 800 USDT
+* Formula: Size(n) = Size(n-1) × (1 + %)
+
+***
+
+#### Count
+
+How many additional orders to place (not counting first).
+
+If you specify "3" — total will be 4 orders.
+
+***
+
+#### Distance
+
+Step between grid orders in percent.
+
+* **Positive** — grid moves away from price
+* **Negative** — grid moves toward price
+
+**Example for "Buy" order:**
+
+Trigger price: 100 USDT
+
+1st order distance: -1% (99 USDT)
+
+Grid step: -0.5%
+
+Count: 3
+
+**Grid:**
+
+1. 99 USDT
+2. 98.505 USDT (99 × 0.995)
+3. 98.012 USDT
+4. 97.522 USDT
+
+***
+
+#### Size Increase
+
+By how much percent to change each next order size.
+
+* **Positive** — size grows
+* **Negative** — size decreases
+
+**Recommendations:**
+
+* Aggressive averaging: 50–150%
+* Moderate: 20–50%
+* Uniform grid: 0%
+
+***
+
+### Take Profit
+
+Automatic profit lock. Enabled by default.
+
+#### Percentage
+
+Distance from entry price:
+
+* Long — above entry price
+* Short — below entry price
+
+⚠️ Percentage must cover exchange commission.
+
+***
+
+#### Order Type
+
+**Limit (recommended):**
+
+* Real order on exchange (r)
+* Visible in order book
+* Works with virtual Stop Loss
+
+**Market:**
+
+* Virtual in core (v)
+* Becomes real when price touches
+* Works with real stop-limit Stop Loss
+
+⚠️ Availability depends on exchange.
+
+***
+
+#### Iceberg
+
+Hides Take Profit size. Independent from main order iceberg.
+
+⚠️ **Important:** works only on spot.
+
+***
+
+#### Auto Price Down
+
+Gradually lowers Take Profit order if price doesn't reach initial level.
+
+**Timer:** how many seconds until next step
+
+**Step:** how much percent to lower
+
+**Limit:** minimum level (can be negative)
+
+**Example:**
+
+Take Profit 1.5%, timer 1 sec, step 0.5%, limit 0.2%
+
+1. Position opened → TP at 1.5%
+2. After 1 sec → TP at 1%
+3. After 1 sec → TP at 0.5%
+4. After 1 sec → TP at 0.2% (minimum)
+5. Stays at 0.2%
+
+⚠️ Increase not provided.
+
+***
+
+### Special Settings
+
+#### Do Not Trigger If Active
+
+Don't place new orders until all from previous trigger are closed.
+
+**When to enable:**
+
+* ✅ Sequential trading without overlaps
+* ❌ Want to open new on repeated signals
+
+***
+
+#### Restart Delay on Critical Event
+
+How many seconds until next possible trigger activation.
+
+⚠️ **Important:** countdown from order placement moment, not from position close moment.
+
+Consider together with "Do not trigger if active", "Short period", "Cancel delay".
+
+***
+
+#### Open Chart on Trigger
+
+Automatically opens pair chart when trigger activates (not when order executes).
+
+***
+
+### Filter Features
+
+Filters are checked **only when placing** orders.
+
+Orders don't move, so filters (leverage, mark price, volumes, funding rate) are checked once.
+
+**Exception — delta filters:**
+
+If "Cancel if out of range" enabled:
+
+* Deltas checked at set frequency
+* Orders cancelled when out of bounds
+* Not reposted automatically
+
+New orders only on new trigger.
+
+***
+
+### Support
+
+Questions about setup or suggestions — contact [support](https://t.me/moontrader_support_en).
+

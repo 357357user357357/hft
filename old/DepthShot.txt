@@ -1,0 +1,455 @@
+# Depth Shot Algorithm
+
+Depth Shots profits from sharp price spikes (breakthroughs) followed by pullbacks. The algorithm places orders not at a fixed distance from price, but based on order volume in the exchange order book.
+
+With smooth volume changes, the order automatically moves. When a breakthrough occurs, the position opens and quickly closes on the pullback.
+
+**Principle:** the algorithm assumes that to execute a given trading volume, price must reach the level where that volume exists in the order book. This approach works more accurately on pairs with sparse order books, where breakthrough sizes vary significantly.
+
+***
+
+### How It Works
+
+1. **Order Book Volume Analysis**
+
+   Continuously tracks cumulative order volume in the book (Bid for buying, Ask for selling).
+2. **Order Placement at Target Volume**
+
+   Order is placed where accumulated volume in the book reaches the set value.
+
+   Example: volume 50,000 USDT → order where 50,000 USDT is accumulated.
+3. **Buffer Around Order**
+
+   A corridor is created where volume can fluctuate without moving the order.
+4. **Automatic Movement**
+   * Far boundary crossed order → order moves toward price
+   * Near boundary crossed order → order moves away from price
+5. **Execution on Breakthrough**
+
+   Sharp price spike toward order → position opens.
+6. **Position Protection**
+
+   Take Profit and Stop Loss are set automatically.
+
+***
+
+### Main Parameters
+
+#### Quote Asset Volume
+
+Target volume in the order book in units of the pair's second currency.
+
+* ETHUSDT — volume in USDT
+* ETHBTC — volume in BTC
+
+This is the volume shown in the exchange order book on the chart.
+
+⚠️ **Important:** specify in numbers without abbreviations. For 1 million USDT: 1000000
+
+**How to determine:**
+
+1. Open order book for selected pair
+2. Find level for order placement
+3. Check accumulated volume to that level
+4. Specify in settings
+
+***
+
+#### Min/Max Distance
+
+Range of distances from price in percent where algorithm can place orders.
+
+If volume is within these boundaries — order is placed. If it goes beyond — behavior depends on "Stop if out of range".
+
+Distance is counted by direction:
+
+* Buy — below price
+* Sell — above price
+
+**Example:**
+
+Price: 50,000 USDT
+
+Min: 0.5%, Max: 2%
+
+Side: Buy
+
+**Placement range:** 49,000 – 49,750 USDT
+
+***
+
+#### Buffer System
+
+Two-level system forms unified buffer zone around order.
+
+#### Volume Buffer
+
+Corridor in quote asset units where volume can fluctuate without moving the order.
+
+On placement, target volume is in buffer center. Size is divided by 2 in each direction.
+
+**Example:**
+
+Volume: 50,000 USDT
+
+Buffer: 4,000 USDT
+
+**Boundaries:**
+
+* Far: 52,000 USDT (+2,000)
+* Near: 48,000 USDT (-2,000)
+
+While volume between 48,000 and 52,000 — order doesn't move.
+
+***
+
+#### Min/Max Buffer
+
+Additional buffer width limitation in percent from price.
+
+Applied to each boundary separately:
+
+**Minimum buffer** — boundary cannot be closer to order
+
+* Prevents collapse when there's a "wall" in order book
+* Zone width always ≥ 2 × min buffer
+
+**Maximum buffer** — boundary cannot be further from order
+
+* Prevents excessive expansion in sparse order books
+
+**How it works:**
+
+1. "Volume buffer" is taken (half from order)
+2. Each boundary is checked:
+   * Within Min/Max → "Volume buffer" is used
+   * Goes beyond → set to nearest Min/Max boundary
+
+**Example:**
+
+Price: 50,000 USDT
+
+Order: 49,500 USDT (1% from price)
+
+Volume buffer: 4,000 USDT (\~8% from price)
+
+Min: 0.2%, Max: 2%
+
+**Without Min/Max:**
+
+* Far: \~52,000 USDT (\~4%) ❌ exceeds Max
+* Near: \~47,000 USDT (\~5%) ❌ exceeds Max
+
+**Result:**
+
+* Far: 50,490 USDT ✅ limited by Max 2%
+* Near: 48,510 USDT ✅ limited by Max 2%
+
+***
+
+### Movement Control
+
+#### Stop If Out of Range
+
+Behavior when volume goes beyond Min/Max distance.
+
+**Disabled (default):**
+
+* Order is fixed at range boundaries
+* Closer than Min → stays at Min
+* Further than Max → stays at Max
+* When volume returns — moves as usual
+
+**Enabled:**
+
+* Order is cancelled when out of range
+* Recheck after set time (default 60 sec)
+* Interval: "General → Restart delay on critical event"
+
+***
+
+#### Use High Frequency Order Book Updates
+
+Frequency of receiving order book data.
+
+**Disabled:**
+
+* Spot: once per 1 sec
+* Futures: once per 0.5 sec
+* Low API load
+* Suitable for most strategies
+
+**Enabled:**
+
+* All markets: once per 0.1 sec
+* Maximum precision
+* High API load
+* Fast API limit consumption
+
+⚠️ **Caution:** on large number of pairs can cause:
+
+* Exchange desync
+* API limit exhaustion
+* Processing delays
+
+**Recommendations:**
+
+* ✅ Enable for 1–5 active pairs
+* ❌ Disable when working with 10+ pairs
+* ❌ Disable with weak internet
+
+***
+
+#### Follow Price Delay
+
+How many seconds to wait before moving order **toward price** after far boundary crosses order.
+
+If volume returns during delay period — order doesn't move.
+
+**Application:** avoids unnecessary movements during temporary fluctuations.
+
+***
+
+#### Replace Delay
+
+How many seconds to wait before moving order **away from price** after near boundary crosses order.
+
+**Application:** filters false signals during temporary volume changes.
+
+***
+
+### Order Parameters
+
+#### Side
+
+**Buy (Long):**
+
+* Order in Bid book
+* Opens low, closes high
+* Expects upward pullback
+
+**Sell (Short):**
+
+* Order in Ask book
+* Opens high, closes low
+* Expects downward pullback
+
+***
+
+#### Client Order Type / Stop Price
+
+What type of order to place and stop price value for stop-limit.
+
+***
+
+#### Order Size
+
+Size in USDT. When trading with leverage, specify full size including leverage.
+
+**Auto-increase button:** raises to exchange minimum for pairs where it's below required.
+
+Minimums on "Management" tab.
+
+***
+
+#### Iceberg
+
+Hides size from order book. Executes in parts. Only for spot markets.
+
+***
+
+#### Auto Join / Join Key
+
+Auto-merge positions on same pair:
+
+* Recalculate weighted average entry price
+* Adjust Take Profit and Stop Loss
+
+**Join key:** unique name for merging only between selected algorithms.
+
+⚠️ **Important:** without key, merges all positions on pair, including manual ones.
+
+***
+
+### Take Profit
+
+Automatic profit lock. Enabled by default.
+
+In Depth Shots, three Take Profit calculation modes. All counted in profitable direction (long — above, short — below).
+
+⚠️ Percentage must cover exchange commission.
+
+***
+
+#### Classic Take Profit
+
+Percent from position opening price.
+
+**Example:**
+
+Entry: 50,000 USDT
+
+TP: 0.5%
+
+Buy
+
+**Result:** TP at 50,250 USDT
+
+**Application:**
+
+* Stable markets with predictable breakthroughs
+* Know exact profit percent
+
+***
+
+#### Historic Take Profit
+
+Percent from distance over last 2 seconds, including breakthrough.
+
+Traveled distance = 100%. You specify pullback percent.
+
+**Formula:**
+
+Distance = |Price 2 sec ago - Current price|
+
+TP = Entry ± (Distance × Percent / 100)
+
+**Example:**
+
+2 sec ago: 50,000 USDT
+
+Entry: 48,500 USDT
+
+Buy
+
+Distance: 1,500 USDT (3%)
+
+Percent: 33%
+
+**Result:**
+
+Pullback: 1,500 × 0.33 = 495 USDT
+
+TP: 48,995 USDT (\~1% from entry)
+
+**Application:**
+
+* Breakthrough size varies significantly
+* Adaptation to movement strength
+* Variable volatility
+
+**Default:** 50% (half distance)
+
+***
+
+#### Depth Take Profit
+
+Percent only from breakthrough size, without preceding movement.
+
+Like historic, but 100% = breakthrough only.
+
+**Formula:**
+
+Breakthrough = |Price before - Entry|
+
+TP = Entry ± (Breakthrough × Percent / 100)
+
+**Example:**
+
+Before breakthrough: 49,500 USDT
+
+Entry: 48,500 USDT
+
+Buy
+
+Breakthrough: 1,000 USDT
+
+Percent: 50%
+
+**Result:**
+
+Pullback: 500 USDT
+
+TP: 49,000 USDT
+
+**Application:**
+
+* Precise binding to breakthrough
+* Pullback from breakthrough matters, not total movement
+
+**Default:** 50%
+
+***
+
+#### TP Types Comparison
+
+**Situation:** smooth decline 50,000 → 49,500 over 2 sec, then breakthrough to 48,500
+
+| Type         | Calculation             | TP Level | Application       |
+| ------------ | ----------------------- | -------- | ----------------- |
+| Classic 1%   | 48,500 × 1.01           | 48,985   | Fixed percent     |
+| Historic 33% | 48,500 + (1,500 × 0.33) | 48,995   | Total movement    |
+| Depth 50%    | 48,500 + (1,000 × 0.5)  | 49,000   | Breakthrough only |
+
+***
+
+#### Order Type
+
+**Limit (recommended):**
+
+* Real on exchange (r)
+* Visible in order book
+* With virtual Stop Loss
+
+**Market:**
+
+* Virtual in core (v)
+* Real when price touches
+* With real stop-limit Stop Loss
+
+⚠️ Availability depends on exchange.
+
+***
+
+#### Iceberg
+
+Hides Take Profit size. Independent from main order iceberg.
+
+***
+
+#### Auto Price Down
+
+Gradually lowers TP order if price doesn't reach initial level.
+
+⚠️ **Important:** regardless of TP type (classic/historic/depth), step and limit **only in percent from entry price**.
+
+**Timer:** how many sec until next step
+
+**Step:** how much % from entry price to lower
+
+**Limit:** minimum level % from entry
+
+**Example:**
+
+Type: Depth 50%
+
+Breakthrough: 3% (1,500 USDT)
+
+Timer: 1 sec, Step: 0.5%, Limit: 0.2%
+
+Entry: 48,500 USDT
+
+1. Opened → TP at 50% breakthrough = 750 = 49,250 (1.5% from entry)
+2. After 1 sec → TP 1% = 48,985
+3. After 1 sec → TP 0.5% = 48,742.5
+4. After 1 sec → TP 0.2% = 48,597 (minimum)
+5. Stays at 0.2%
+
+⚠️ Increase not provided.
+
+***
+
+### Support
+
+Questions about setup or suggestions — contact [support](https://t.me/moontrader_support_en).
+

@@ -1,0 +1,230 @@
+# Take-Profit
+
+Take-Profit is an order for locking profit. It's placed automatically when position opens above entry price for Buy and below for Sell.
+
+**Important:** Take-Profit size must cover exchange commissions, otherwise trade will be unprofitable.
+
+All Take-Profit settings apply to all positions from one source: specific algorithm, preset, or manual trading settings.
+
+***
+
+### Setting Take-Profit Level
+
+#### For Manual Trading and Shots, Averages, Signal Algorithms
+
+**Percentage** — distance from position opening price to Take-Profit order.
+
+* Specify whole or fractional value in percent
+* Positive values counted in profitable direction
+* Negative values lead to immediate position close at market price
+
+**Example:** when opening position at 100 USDT with 1.5% Take-Profit, order places at 101.5 USDT for Buy and 98.5 USDT for Sell.
+
+***
+
+#### For Depth Shots Algorithm
+
+In Depth Shots, three Take-Profit calculation variants available:
+
+#### **Classic**
+
+Works same as in other algorithms — fixed percent from position opening price.
+
+#### **Historic**
+
+Percent calculated from distance that price traveled in last 2 seconds before position opening (including breakthrough).
+
+**How to use:**
+
+1. Distance traveled by price is taken as 100%
+2. Specify "pullback" percent for Take-Profit placement
+
+**Example:** price traveled 3% in 2 seconds. You expect pullback by third of this distance (1% from price). Specify 33% in "Percentage" field. On 6% breakthrough, Take-Profit places at 2% from entry price.
+
+#### **Depth**
+
+Works like "Historic", but 100% is only breakthrough size without previous 2 seconds.
+
+***
+
+#### For Vector Algorithm
+
+**Important difference:** Take-Profit specified in percent from spread size, not from asset price.
+
+**What is spread in Vector:** Spread is the difference between maximum and minimum price in frame.
+
+**Level calculation:**
+
+* **For Buy:** counted from lower spread boundary in current frame
+* **For Sell:** counted from upper spread boundary in current frame
+
+**Why calculation from spread, not price:**
+
+Vector algorithm with Min Spread Size = 0.5% can trigger both at 1% spread and 5% spread. With such difference in situations, it's more logical to place Take-Profit depending on found divergence.
+
+**Example for Buy:**
+
+Lower spread boundary = 100
+
+Spread = 10 (difference between maximum and minimum in frame)
+
+Take-Profit = 50%
+
+Distance in points = 10 × 50% = 5
+
+Take-Profit price = 100 + 5 = **105**
+
+***
+
+#### Adaptive Take Profit
+
+Automatically adjusts Take-Profit distance considering spread boundary movement trend.
+
+**Enabling:**
+
+Enable "Use Adaptive TakeProfit" checkbox in Vector algorithm settings.
+
+**How it works:**
+
+1. Analyzes how corresponding spread boundary changed between all frames in Time Frame
+2. Calculates average change in absolute price units
+3. Adds this value to base Take-Profit price
+
+**Average change formula:**
+
+```
+((a2-a1) + (a3-a2) + (a4-a3) + ...) / n
+```
+
+where a — boundary value in each frame, n — number of transitions between frames.
+
+* **For Buy:** lower spread boundary used
+* **For Sell:** upper spread boundary used
+
+**Example for Buy:**
+
+4 frames with lower boundaries: 100, 110, 120, 130
+
+Last frame: lower boundary = 130, spread = 100
+
+Take-Profit = 90%
+
+**Change calculation:**
+
+* (110 - 100) = +10
+* (120 - 110) = +10
+* (130 - 120) = +10
+
+Average change = (+10 + +10 + +10) / 3 = **+10**
+
+**Without adaptation:**
+
+Take-Profit price = 130 + (100 × 90%) = 130 + 90 = **220**
+
+**With adaptation:**
+
+Take-Profit price = 220 + 10 = **230**
+
+**Result:** Take-Profit placed higher, as lower boundary steadily rises (+10 in each transition).
+
+**When adaptation doesn't affect:**
+
+If changes are multidirectional (example: +10, -5, +3, -8), average change is close to zero, and adaptation practically doesn't affect Take-Profit price.
+
+***
+
+### General Settings
+
+Apply to manual trading and all algorithms.
+
+#### Enable/Disable
+
+Take-Profit enabled by default. Uncheck to open positions without Take-Profit.
+
+#### Order Type
+
+**Limit** (default)
+
+* Real limit order placed on exchange
+* Marked with green "r" symbol in settings header
+* Works with virtual Stop Loss
+
+**Market**
+
+* Availability depends on exchange
+* Order is virtual (marked with purple "v" symbol)
+* Information stored only in MoonTrader core
+* Sent to exchange only when Take-Profit price reached
+* Works with real stop-limit Stop Loss
+
+#### Iceberg
+
+Available for spot trading. Allows hiding true order size from exchange order book, placing orders and executing them in parts.
+
+Applies only to Take-Profit regardless of main order iceberg settings.
+
+***
+
+### Auto Price Down
+
+Sequential Take-Profit price correction toward lower profit level.
+
+#### Parameters
+
+**Timer** — delay time before each lowering step (in seconds). Whole and fractional values allowed. Countdown starts from order placement moment.
+
+**Step** — Take-Profit decrease size in percent from position opening price.
+
+**Important:** step always specified in percent from opening price, even in Depth Shots and Vector where initial level is calculated dynamically.
+
+**Limit** — minimum value in percent from opening price to which auto-lowering is allowed. Can be negative — in this case execution will lead to position close at loss.
+
+**Important:** in Depth Shots and Vector, if calculated Take-Profit is less than limit, then after timer expires it will place at limit level and won't change further.
+
+Take-Profit increase not provided.
+
+#### Examples
+
+#### For Shots Algorithm
+
+**Task:** extract 1.5% profit, and if doesn't work — lock minimum 0.2% after several seconds.
+
+**Settings:**
+
+* Take-Profit: 1.5%
+* Timer: 1 second
+* Step: 0.5%
+* Limit: 0.2%
+
+**How it works:**
+
+1. On position open, Take-Profit at 1.5%
+2. After 1 second — at 1%
+3. After 1 more second — at 0.5%
+4. After 1 more second — at 0.2% (minimum limit)
+5. Stays at this level until trade closes
+
+#### For Depth Shots Algorithm
+
+**Task:** extract 50% profit from breakthrough, and if doesn't work — lock minimum 0.2% from opening price after several seconds.
+
+**Settings:**
+
+* Take-Profit "Depth": 50%
+* Timer: 1 second
+* Step: 0.5%
+* Limit: 0.2%
+
+**How it works:**
+
+Breakthrough size — 3%. Take-Profit places at 50% of breakthrough (1.5% from opening price).
+
+1. After 1 second — at 1% from price
+2. After 1 more second — at 0.5%
+3. After 1 more second — at 0.2% (minimum limit)
+4. Stays at this level until trade closes
+
+### Support
+
+If you have questions about Take-Profit setup or want to suggest improvements, contact [support](https://t.me/moontrader_support_en).
+
