@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+    - name: Run tests
+      run: |
+        python -m pytest tests/ -v --tb=short
+
+    - name: Test math modules
+      run: |
+        python -m pytest tests/test_math_modules.py -v
+
+    - name: Test algorithms
+      run: |
+        python -m pytest tests/test_algorithms.py -v
+
+    - name: Test agents
+      run: |
+        python -m pytest tests/test_agents.py -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Check imports
+      run: |
+        python -c "
+        import sys
+        sys.path.insert(0, '.')
+        from instrument_index import InstrumentIndexer
+        from signal_gate import SignalGate
+        from regime_detector import RegimeDetector
+        print('All core imports OK')
+        "

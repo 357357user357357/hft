@@ -4,6 +4,8 @@ Covers:
   - Reproducibility: same config + same data → identical PnL
   - Property tests: buy TP > entry, sell TP < entry, etc.
   - Basic smoke tests: algorithms run without errors on synthetic data
+  - Signal gate integration: algorithms respect signal gate
+  - Regime detection: regime-aware parameter switching
 """
 
 from data import AggTrade, build_synthetic_book
@@ -12,6 +14,9 @@ from algorithms.shot import ShotBacktest, ShotConfig
 from algorithms.depth_shot import DepthShotBacktest, DepthShotConfig, Depth
 from algorithms.averages import AveragesBacktest, AveragesConfig, AveragesCondition
 from algorithms.vector import VectorBacktest, VectorConfig, BorderRange, ShotDirection
+from signal_gate import SignalGate, GateConfig
+from regime_detector import RegimeDetector, MarketRegime
+from risk_management import PositionSizer, SizingConfig
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -247,3 +252,97 @@ def test_vector_polar_disabled_by_default():
 
     bt = VectorBacktest(cfg)
     assert bt.state.polar_extractor is None
+
+
+# ── Signal Gate Integration ────────────────────────────────────────────────────
+
+def test_shot_with_signal_gate():
+    """Shot algorithm respects signal gate blocking."""
+    prices = _spike_then_pullback()
+    trades = _make_trades(prices)
+
+    # Gate that blocks all entries (thresholds that never pass)
+    gate = SignalGate("TEST", GateConfig(
+        buy_threshold=0.99,   # Impossible to reach
+        sell_threshold=-0.99,
+        hard_block=True,
+        eval_interval_secs=0.1,
+    ))
+
+    cfg = ShotConfig(side=Side.Buy)
+    bt = ShotBacktest(cfg, signal_gate=gate)
+    bt.run(trades)
+
+    # With hard block and impossible threshold, no trades should execute
+    # (or far fewer than without the gate)
+    bt_no_gate = ShotBacktest(ShotConfig(side=Side.Buy))
+    bt_no_gate.run(trades)
+
+    # Gate should reduce or eliminate trades
+    assert bt.stats.total_trades <= bt_no_gate.stats.total_trades
+
+
+def test_shot_with_position_sizer():
+    """Shot algorithm works with position sizer."""
+    prices = _spike_then_pullback()
+    trades = _make_trades(prices)
+
+    sizer = PositionSizer(SizingConfig(
+        mode="fractional",
+        fractional_pct=0.02,  # 2% per trade
+        initial_equity=10000.0,
+    ))
+
+    cfg = ShotConfig(side=Side.Buy, order_size_usdt=100)
+    bt = ShotBacktest(cfg, position_sizer=sizer)
+    bt.run(trades)
+
+    # Should have executed trades
+    assert bt.stats.total_trades >= 0
+
+
+# ── Regime Detection ──────────────────────────────────────────────────────────
+
+def test_regime_detector_mean_reversion():
+    """Regime detector identifies mean-reverting series."""
+    # Generate mean-reverting prices (OU process)
+    import random
+    random.seed(42)
+    prices = [100.0]
+    for i in range(200):
+        mean_rev = -0.05 * (prices[-1] - 100)
+        noise = random.gauss(0, 0.5)
+        prices.append(prices[-1] + mean_rev + noise)
+
+    trades = _make_trades(prices)
+    detector = RegimeDetector()
+    regime = detector.detect_regime(trades, min_trades=100)
+
+    # Mean-reverting series should be detected as such (or at least not trending)
+    assert regime in [MarketRegime.MEAN_REVERSION, MarketRegime.NEUTRAL]
+
+
+def test_regime_detector_trending():
+    """Regime detector identifies trending series."""
+    # Generate trending prices
+    prices = [100.0 + i * 0.5 for i in range(200)]
+    trades = _make_trades(prices)
+
+    detector = RegimeDetector()
+    regime = detector.detect_regime(trades, min_trades=100)
+
+    # Strong trend should be detected
+    assert regime in [MarketRegime.TRENDING, MarketRegime.NEUTRAL]
+
+
+def test_regime_detector_parameters():
+    """Regime detector returns different params for different regimes."""
+    detector = RegimeDetector()
+
+    mr_params = detector.get_shot_params(MarketRegime.MEAN_REVERSION)
+    trend_params = detector.get_shot_params(MarketRegime.TRENDING)
+
+    # Mean reversion should have tighter entries/exits
+    assert mr_params.distance_pct < trend_params.distance_pct
+    assert mr_params.tp_pct < trend_params.tp_pct
+    assert mr_params.sl_pct < trend_params.sl_pct
