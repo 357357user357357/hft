@@ -15,6 +15,7 @@ from hft_types import (
 )
 from data import AggTrade
 from slippage import SlippageModel
+from signal_gate import SignalGate
 
 
 @dataclass
@@ -102,7 +103,8 @@ class AveragesState:
 class AveragesBacktest:
     def __init__(self, config: AveragesConfig, slippage: Optional[SlippageModel] = None,
                  maker_fee_pct: float = 0.02, taker_fee_pct: float = 0.05,
-                 use_taker_fee: bool = True):
+                 use_taker_fee: bool = True, position_sizer: Optional["PositionSizer"] = None,
+                 signal_gate: Optional[SignalGate] = None):
         self.config = config
         self.state = AveragesState(config)
         self.results: List[TradeResult] = []
@@ -111,11 +113,17 @@ class AveragesBacktest:
         self.maker_fee_pct = maker_fee_pct
         self.taker_fee_pct = taker_fee_pct
         self.use_taker_fee = use_taker_fee
+        self.position_sizer = position_sizer
+        self.signal_gate = signal_gate
         self._last_entry_slippage: float = 0.0
 
     def on_trade(self, trade: AggTrade) -> None:
         price = trade.price
         ts_ns = trade.timestamp_ns()
+
+        # Feed the signal gate
+        if self.signal_gate is not None:
+            self.signal_gate.on_trade(price, trade.quantity, ts_ns)
 
         for long_avg, short_avg in self.state.averages:
             long_avg.push(ts_ns, price)
@@ -214,11 +222,18 @@ class AveragesBacktest:
             self._open_position(order.price, order.size_usdt, ts_ns)
 
     def _open_position(self, signal_price: float, size_usdt: float, ts_ns: int) -> None:
+        # Signal gate check
+        gate_confidence = 1.0
+        if self.signal_gate is not None:
+            allowed, gate_confidence = self.signal_gate.should_enter(self.config.side)
+            if not allowed:
+                return
+
         # Apply slippage to get realistic fill price
         fill_price = signal_price
         slippage_pct = 0.0
         if self.slippage is not None:
-            fill_price = self.slippage.apply(signal_price, self.config.side, size_usdt)
+            fill_price = self.slippage.apply(signal_price, self.config.side, size_usdt * gate_confidence)
             slippage_pct = abs(fill_price - signal_price) / signal_price * 100.0
 
         tp_pct = self.config.take_profit.percentage
@@ -231,8 +246,9 @@ class AveragesBacktest:
             tp_price = fill_price * (1.0 - tp_pct / 100.0)
             sl_price = fill_price * (1.0 + sl_pct / 100.0)
 
+        adjusted_size = size_usdt * gate_confidence
         self.state.position = Position.new(
-            self.config.side, fill_price, size_usdt,
+            self.config.side, fill_price, adjusted_size,
             ts_ns, tp_price, sl_price, tp_pct
         )
         self.state.sl_placed_at = ts_ns

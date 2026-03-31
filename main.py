@@ -37,6 +37,9 @@ from config import load_config, save_current_config
 from slippage import SlippageModel, SlippageConfig
 from algorithms.averages import AveragesBacktest, AveragesConfig, AveragesCondition
 from algorithms.vector import VectorBacktest, VectorConfig, BorderRange, ShotDirection
+from risk_management import PositionSizer, SizingConfig
+from signal_gate import SignalGate, GateConfig
+from regime_detector import RegimeDetector, MarketRegime
 
 
 def parse_side(s: str) -> Side:
@@ -64,19 +67,41 @@ def collect_files(args) -> List[Path]:
 
 def run_shot(trades: List[AggTrade], side: Side, slippage: Optional[SlippageModel] = None,
              maker_fee_pct: float = 0.02, taker_fee_pct: float = 0.05,
-             position_sizer: Optional["PositionSizer"] = None) -> None:
+             position_sizer: Optional[PositionSizer] = None,
+             signal_gate: Optional[SignalGate] = None,
+             regime_detector: Optional[RegimeDetector] = None) -> None:
     logger.info("--- Running Shot Algorithm ---")
+
+    # Detect regime and get parameters if enabled
+    distance_pct = C.SHOT_DISTANCE_PCT
+    buffer_pct = C.SHOT_BUFFER_PCT
+    tp_pct = C.SHOT_TP_PCT
+    sl_pct = C.SHOT_SL_PCT
+    follow_delay = C.SHOT_FOLLOW_DELAY_SECS
+    replace_delay = C.SHOT_REPLACE_DELAY_SECS
+
+    if regime_detector is not None and len(trades) > 100:
+        regime = regime_detector.detect_regime(trades)
+        params = regime_detector.get_shot_params(regime)
+        distance_pct = params.distance_pct
+        buffer_pct = params.buffer_pct
+        tp_pct = params.tp_pct
+        sl_pct = params.sl_pct
+        follow_delay = params.follow_delay_secs
+        replace_delay = params.replace_delay_secs
+        logger.info("  Regime: %s (distance=%.2f%% buffer=%.2f%% TP=%.2f%% SL=%.2f%%)",
+                    regime.value, distance_pct, buffer_pct, tp_pct, sl_pct)
 
     config = ShotConfig(
         side=side,
-        distance_pct=C.SHOT_DISTANCE_PCT,
-        buffer_pct=C.SHOT_BUFFER_PCT,
-        follow_price_delay_secs=C.SHOT_FOLLOW_DELAY_SECS,
-        replace_delay_secs=C.SHOT_REPLACE_DELAY_SECS,
+        distance_pct=distance_pct,
+        buffer_pct=buffer_pct,
+        follow_price_delay_secs=follow_delay,
+        replace_delay_secs=replace_delay,
         order_size_usdt=C.DEFAULT_ORDER_SIZE_USDT,
         take_profit=TakeProfitConfig(
             enabled=True,
-            percentage=C.SHOT_TP_PCT,
+            percentage=tp_pct,
             auto_price_down=AutoPriceDown(
                 timer_secs=C.SHOT_TP_AUTO_DOWN_TIMER,
                 step_pct=C.SHOT_TP_AUTO_DOWN_STEP,
@@ -85,7 +110,7 @@ def run_shot(trades: List[AggTrade], side: Side, slippage: Optional[SlippageMode
         ),
         stop_loss=StopLossConfig(
             enabled=True,
-            percentage=C.SHOT_SL_PCT,
+            percentage=sl_pct,
             spread_pct=C.SHOT_SL_SPREAD_PCT,
             delay_secs=C.SHOT_SL_DELAY_SECS,
             trailing=None,
@@ -94,7 +119,8 @@ def run_shot(trades: List[AggTrade], side: Side, slippage: Optional[SlippageMode
     )
 
     backtest = ShotBacktest(config, slippage=slippage, maker_fee_pct=maker_fee_pct,
-                            taker_fee_pct=taker_fee_pct, position_sizer=position_sizer)
+                            taker_fee_pct=taker_fee_pct, position_sizer=position_sizer,
+                            signal_gate=signal_gate)
     backtest.run(trades)
     backtest.stats.print_summary("Shot")
     print_sample_trades(backtest.results, 5)
@@ -102,14 +128,34 @@ def run_shot(trades: List[AggTrade], side: Side, slippage: Optional[SlippageMode
 
 def run_depth_shot(trades: List[AggTrade], side: Side, slippage: Optional[SlippageModel] = None,
                    maker_fee_pct: float = 0.02, taker_fee_pct: float = 0.05,
-                   position_sizer: Optional["PositionSizer"] = None) -> None:
+                   position_sizer: Optional[PositionSizer] = None,
+                   signal_gate: Optional[SignalGate] = None,
+                   regime_detector: Optional[RegimeDetector] = None) -> None:
     logger.info("--- Running Depth Shot Algorithm ---")
+
+    # Detect regime and get parameters if enabled
+    target_volume = C.DEPTH_TARGET_VOLUME
+    min_dist = C.DEPTH_MIN_DISTANCE_PCT
+    max_dist = C.DEPTH_MAX_DISTANCE_PCT
+    tp_pct = C.DEPTH_TP_PERCENTAGE
+    sl_pct = C.DEPTH_SL_PCT
+
+    if regime_detector is not None and len(trades) > 100:
+        regime = regime_detector.detect_regime(trades)
+        params = regime_detector.get_depth_shot_params(regime)
+        target_volume = params.target_volume
+        min_dist = params.min_distance_pct
+        max_dist = params.max_distance_pct
+        tp_pct = params.tp_percentage
+        sl_pct = params.sl_pct
+        logger.info("  Regime: %s (target_vol=%.1f TP=%.1f%% SL=%.1f%%)",
+                    regime.value, target_volume, tp_pct, sl_pct)
 
     config = DepthShotConfig(
         side=side,
-        target_volume=C.DEPTH_TARGET_VOLUME,
-        min_distance_pct=C.DEPTH_MIN_DISTANCE_PCT,
-        max_distance_pct=C.DEPTH_MAX_DISTANCE_PCT,
+        target_volume=target_volume,
+        min_distance_pct=min_dist,
+        max_distance_pct=max_dist,
         volume_buffer=C.DEPTH_VOLUME_BUFFER,
         min_buffer_pct=C.DEPTH_MIN_BUFFER_PCT,
         max_buffer_pct=C.DEPTH_MAX_BUFFER_PCT,
@@ -117,7 +163,7 @@ def run_depth_shot(trades: List[AggTrade], side: Side, slippage: Optional[Slippa
         follow_price_delay_secs=C.SHOT_FOLLOW_DELAY_SECS,
         replace_delay_secs=C.SHOT_REPLACE_DELAY_SECS,
         order_size_usdt=C.DEFAULT_ORDER_SIZE_USDT,
-        take_profit_mode=Depth(percentage=C.DEPTH_TP_PERCENTAGE),
+        take_profit_mode=Depth(percentage=tp_pct),
         auto_price_down=AutoPriceDown(
             timer_secs=C.DEPTH_AUTO_DOWN_TIMER,
             step_pct=C.DEPTH_AUTO_DOWN_STEP,
@@ -125,7 +171,7 @@ def run_depth_shot(trades: List[AggTrade], side: Side, slippage: Optional[Slippa
         ),
         stop_loss=StopLossConfig(
             enabled=True,
-            percentage=C.DEPTH_SL_PCT,
+            percentage=sl_pct,
             spread_pct=C.DEPTH_SL_SPREAD,
             delay_secs=C.DEPTH_SL_DELAY,
             trailing=None,
@@ -136,7 +182,8 @@ def run_depth_shot(trades: List[AggTrade], side: Side, slippage: Optional[Slippa
     tick_size = trades[0].price * C.DEPTH_TICK_SCALE if trades else 1.0
 
     backtest = DepthShotBacktest(config, slippage=slippage, maker_fee_pct=maker_fee_pct,
-                                 taker_fee_pct=taker_fee_pct, position_sizer=position_sizer)
+                                 taker_fee_pct=taker_fee_pct, position_sizer=position_sizer,
+                                 signal_gate=signal_gate)
     backtest.run(trades, lambda window: build_synthetic_book(window, C.DEPTH_SYNTHETIC_LEVELS, tick_size))
     backtest.stats.print_summary("Depth Shot")
     print_sample_trades(backtest.results, 5)
@@ -144,23 +191,39 @@ def run_depth_shot(trades: List[AggTrade], side: Side, slippage: Optional[Slippa
 
 def run_averages(trades: List[AggTrade], side: Side, slippage: Optional[SlippageModel] = None,
                  maker_fee_pct: float = 0.02, taker_fee_pct: float = 0.05,
-                 position_sizer: Optional["PositionSizer"] = None) -> None:
+                 position_sizer: Optional[PositionSizer] = None,
+                 signal_gate: Optional[SignalGate] = None,
+                 regime_detector: Optional[RegimeDetector] = None) -> None:
     logger.info("--- Running Averages Algorithm ---")
 
-    if side == Side.Buy:
-        trigger_min, trigger_max = C.AVG_BUY_TRIGGER_MIN, C.AVG_BUY_TRIGGER_MAX
-        order_distance_pct = C.AVG_ORDER_DISTANCE_BUY
-    else:
-        trigger_min, trigger_max = C.AVG_SELL_TRIGGER_MIN, C.AVG_SELL_TRIGGER_MAX
-        order_distance_pct = C.AVG_ORDER_DISTANCE_SELL
+    # Detect regime and get parameters if enabled
+    long_period = C.AVG_LONG_PERIOD_SECS
+    short_period = C.AVG_SHORT_PERIOD_SECS
+    tp_pct = C.AVG_TP_PCT
+    sl_pct = C.AVG_SL_PCT
+    order_distance_pct = C.AVG_ORDER_DISTANCE_BUY if side == Side.Buy else C.AVG_ORDER_DISTANCE_SELL
+    trigger_min, trigger_max = (C.AVG_BUY_TRIGGER_MIN, C.AVG_BUY_TRIGGER_MAX) if side == Side.Buy else (C.AVG_SELL_TRIGGER_MIN, C.AVG_SELL_TRIGGER_MAX)
+
+    if regime_detector is not None and len(trades) > 100:
+        regime = regime_detector.detect_regime(trades)
+        params = regime_detector.get_averages_params(regime)
+        long_period = params.long_period_secs
+        short_period = params.short_period_secs
+        tp_pct = params.tp_pct
+        sl_pct = params.sl_pct
+        order_distance_pct = params.order_distance_pct
+        trigger_min = params.trigger_min_pct
+        trigger_max = params.trigger_max_pct
+        logger.info("  Regime: %s (long=%.1fs short=%.1fs TP=%.1f%% SL=%.1f%%)",
+                    regime.value, long_period, short_period, tp_pct, sl_pct)
 
     config = AveragesConfig(
         side=side,
         order_distance_pct=order_distance_pct,
         conditions=[
             AveragesCondition(
-                long_period_secs=C.AVG_LONG_PERIOD_SECS,
-                short_period_secs=C.AVG_SHORT_PERIOD_SECS,
+                long_period_secs=long_period,
+                short_period_secs=short_period,
                 trigger_min_pct=trigger_min,
                 trigger_max_pct=trigger_max,
             ),
@@ -171,12 +234,12 @@ def run_averages(trades: List[AggTrade], side: Side, slippage: Optional[Slippage
         restart_delay_secs=C.AVG_RESTART_DELAY,
         take_profit=TakeProfitConfig(
             enabled=True,
-            percentage=C.AVG_TP_PCT,
+            percentage=tp_pct,
             auto_price_down=None,
         ),
         stop_loss=StopLossConfig(
             enabled=True,
-            percentage=C.AVG_SL_PCT,
+            percentage=sl_pct,
             spread_pct=C.AVG_SL_SPREAD,
             delay_secs=0.0,
             trailing=None,
@@ -186,7 +249,8 @@ def run_averages(trades: List[AggTrade], side: Side, slippage: Optional[Slippage
     )
 
     backtest = AveragesBacktest(config, slippage=slippage, maker_fee_pct=maker_fee_pct,
-                                taker_fee_pct=taker_fee_pct, position_sizer=position_sizer)
+                                taker_fee_pct=taker_fee_pct, position_sizer=position_sizer,
+                                signal_gate=signal_gate)
     backtest.run(trades)
     backtest.stats.print_summary("Averages")
     print_sample_trades(backtest.results, 5)
@@ -194,32 +258,54 @@ def run_averages(trades: List[AggTrade], side: Side, slippage: Optional[Slippage
 
 def run_vector(trades: List[AggTrade], side: Side, slippage: Optional[SlippageModel] = None,
                maker_fee_pct: float = 0.02, taker_fee_pct: float = 0.05,
-               position_sizer: Optional["PositionSizer"] = None) -> None:
+               position_sizer: Optional[PositionSizer] = None,
+               signal_gate: Optional[SignalGate] = None,
+               regime_detector: Optional[RegimeDetector] = None) -> None:
     logger.info("--- Running Vector Algorithm ---")
+
+    # Detect regime and get parameters if enabled
+    frame_size = C.VEC_FRAME_SIZE_SECS
+    min_spread = C.VEC_MIN_SPREAD_PCT
+    order_dist = C.VEC_ORDER_DISTANCE_PCT
+    tp_spread = C.VEC_TP_SPREAD_PCT
+    sl_pct = C.VEC_SL_PCT
+    max_orders = C.VEC_MAX_ORDERS
+
+    if regime_detector is not None and len(trades) > 100:
+        regime = regime_detector.detect_regime(trades)
+        params = regime_detector.get_vector_params(regime)
+        frame_size = params.frame_size_secs
+        min_spread = params.min_spread_pct
+        order_dist = params.order_distance_pct
+        tp_spread = params.tp_spread_pct
+        sl_pct = params.sl_pct
+        max_orders = params.max_orders
+        logger.info("  Regime: %s (frame=%.2fs spread=%.2f%% orders=%d)",
+                    regime.value, frame_size, min_spread, max_orders)
 
     config = VectorConfig(
         side=side,
-        frame_size_secs=C.VEC_FRAME_SIZE_SECS,
+        frame_size_secs=frame_size,
         time_frame_secs=C.VEC_TIME_FRAME_SECS,
-        min_spread_size_pct=C.VEC_MIN_SPREAD_PCT,
+        min_spread_size_pct=min_spread,
         upper_border_range=BorderRange(enabled=False, min_pct=0.0, max_pct=100.0),
         lower_border_range=BorderRange(enabled=False, min_pct=0.0, max_pct=100.0),
         min_trades_per_frame=C.VEC_MIN_TRADES_PER_FRAME,
         min_quote_asset_volume=C.VEC_MIN_QUOTE_VOLUME,
-        order_distance_pct=C.VEC_ORDER_DISTANCE_PCT,
+        order_distance_pct=order_dist,
         use_adaptive_order_distance=True,
         order_lifetime_secs=C.VEC_ORDER_LIFETIME_SECS,
-        max_orders=C.VEC_MAX_ORDERS,
+        max_orders=max_orders,
         order_frequency_secs=C.VEC_ORDER_FREQ_SECS,
         detect_shot=False,
         detect_shot_pullback_pct=C.VEC_PULLBACK_PCT,
         shot_direction=ShotDirection.Down,
-        take_profit_spread_pct=C.VEC_TP_SPREAD_PCT,
+        take_profit_spread_pct=tp_spread,
         use_adaptive_take_profit=True,
         auto_price_down=None,
         stop_loss=StopLossConfig(
             enabled=True,
-            percentage=C.VEC_SL_PCT,
+            percentage=sl_pct,
             spread_pct=C.VEC_SL_SPREAD,
             delay_secs=0.0,
             trailing=None,
@@ -229,7 +315,8 @@ def run_vector(trades: List[AggTrade], side: Side, slippage: Optional[SlippageMo
     )
 
     backtest = VectorBacktest(config, slippage=slippage, maker_fee_pct=maker_fee_pct,
-                              taker_fee_pct=taker_fee_pct, position_sizer=position_sizer)
+                              taker_fee_pct=taker_fee_pct, position_sizer=position_sizer,
+                              signal_gate=signal_gate)
     backtest.run(trades)
     backtest.stats.print_summary("Vector")
     print_sample_trades(backtest.results, 5)
@@ -285,6 +372,14 @@ def main() -> None:
                         help="Position size %% of equity (for fractional mode)")
     parser.add_argument("--initial-equity", type=float, default=C.INITIAL_EQUITY_USDT,
                         help="Starting equity in USDT")
+    parser.add_argument("--signals", action="store_true",
+                        help="Enable 19-dimension signal gate for entry filtering")
+    parser.add_argument("--regime", action="store_true",
+                        help="Enable regime-aware parameter switching")
+    parser.add_argument("--signal-interval", type=float, default=5.0,
+                        help="Signal gate re-evaluation interval in seconds (default: 5.0)")
+    parser.add_argument("--hard-block", action="store_true",
+                        help="Hard-block entries on bad signals (vs just reducing size)")
     args = parser.parse_args()
 
     level = logging.DEBUG if args.verbose else (logging.WARNING if args.quiet else logging.INFO)
@@ -315,6 +410,24 @@ def main() -> None:
         initial_equity=args.initial_equity,
     ))
     logger.info("Position sizing: %s (initial equity: $%.2f)", args.sizing_mode, args.initial_equity)
+
+    # Initialize signal gate and regime detector
+    signal_gate: Optional[SignalGate] = None
+    regime_detector: Optional[RegimeDetector] = None
+
+    if args.signals or args.regime:
+        symbol = args.symbol or "UNKNOWN"
+        if args.signals:
+            gate_config = GateConfig(
+                eval_interval_secs=args.signal_interval,
+                hard_block=args.hard_block,
+            )
+            signal_gate = SignalGate(symbol, gate_config)
+            logger.info("Signal gate: enabled (interval=%.1fs hard_block=%s)",
+                        args.signal_interval, "yes" if args.hard_block else "no")
+        if args.regime:
+            regime_detector = RegimeDetector()
+            logger.info("Regime detector: enabled")
 
     if args.save_config:
         save_current_config(args.save_config)
@@ -361,13 +474,13 @@ def main() -> None:
 
     runners = []
     if algo in ("shot", "all"):
-        runners.append(("Shot", run_shot, all_trades, side, slippage, args.maker_fee, args.taker_fee, position_sizer))
+        runners.append(("Shot", run_shot, all_trades, side, slippage, args.maker_fee, args.taker_fee, position_sizer, signal_gate, regime_detector))
     if algo in ("depth_shot", "all"):
-        runners.append(("DepthShot", run_depth_shot, all_trades, side, slippage, args.maker_fee, args.taker_fee, position_sizer))
+        runners.append(("DepthShot", run_depth_shot, all_trades, side, slippage, args.maker_fee, args.taker_fee, position_sizer, signal_gate, regime_detector))
     if algo in ("averages", "all"):
-        runners.append(("Averages", run_averages, all_trades, side, slippage, args.maker_fee, args.taker_fee, position_sizer))
+        runners.append(("Averages", run_averages, all_trades, side, slippage, args.maker_fee, args.taker_fee, position_sizer, signal_gate, regime_detector))
     if algo in ("vector", "all"):
-        runners.append(("Vector", run_vector, all_trades, side, slippage, args.maker_fee, args.taker_fee, position_sizer))
+        runners.append(("Vector", run_vector, all_trades, side, slippage, args.maker_fee, args.taker_fee, position_sizer, signal_gate, regime_detector))
 
     if args.parallel and len(runners) > 1:
         logger.info("Running %d algorithms in parallel ...", len(runners))
@@ -391,7 +504,7 @@ def main() -> None:
 
         with ThreadPoolExecutor(max_workers=len(runners)) as pool:
             futures = {
-                pool.submit(fn, trades, s, make_slippage(), mf, tf, make_sizer()): name
+                pool.submit(fn, trades, s, make_slippage(), mf, tf, make_sizer(), signal_gate, regime_detector): name
                 for name, fn, trades, s, _slip, mf, tf, _ps in runners
             }
             for future in as_completed(futures):
@@ -401,8 +514,8 @@ def main() -> None:
                 except Exception as exc:
                     logger.error("%s raised: %s", name, exc)
     else:
-        for name, fn, trades, s, slip, mf, tf, ps in runners:
-            fn(trades, s, slip, mf, tf, ps)
+        for name, fn, trades, s, slip, mf, tf, ps, sg, rd in runners:
+            fn(trades, s, slip, mf, tf, ps, sg, rd)
 
 
 if __name__ == "__main__":

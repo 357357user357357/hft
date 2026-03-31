@@ -18,6 +18,7 @@ from hft_types import (
 from data import AggTrade
 from slippage import SlippageModel
 from polar_features import PolarExtractor, PolarSignalGenerator, PolarSignalType
+from signal_gate import SignalGate
 
 
 @dataclass
@@ -143,7 +144,8 @@ class VectorBacktest:
     def __init__(self, config: VectorConfig, slippage: Optional[SlippageModel] = None,
                  maker_fee_pct: float = C.VECTOR_DEFAULT_MAKER_FEE_PCT,
                  taker_fee_pct: float = C.VECTOR_DEFAULT_TAKER_FEE_PCT,
-                 position_sizer: Optional["PositionSizer"] = None):
+                 position_sizer: Optional["PositionSizer"] = None,
+                 signal_gate: Optional[SignalGate] = None):
         self.config = config
         self.state = VectorState(config)  # Pass config for polar init
         self.results: List[TradeResult] = []
@@ -152,6 +154,7 @@ class VectorBacktest:
         self.maker_fee_pct = maker_fee_pct
         self.taker_fee_pct = taker_fee_pct
         self.position_sizer = position_sizer
+        self.signal_gate = signal_gate
         self._last_entry_slippage: float = 0.0
         self._last_polar_signal: Optional[PolarSignalType] = None
 
@@ -159,6 +162,10 @@ class VectorBacktest:
         price = trade.price
         ts_ns = trade.timestamp_ns()
         quote_vol = trade.quote_volume()
+
+        # Feed the signal gate
+        if self.signal_gate is not None:
+            self.signal_gate.on_trade(price, trade.quantity, ts_ns)
 
         # Update polar features (if enabled)
         if self.config.use_polar_signals:
@@ -408,6 +415,13 @@ class VectorBacktest:
         spread = last_frame.spread()
         frames = list(self.state.frames)
 
+        # Signal gate check
+        gate_confidence = 1.0
+        if self.signal_gate is not None:
+            allowed, gate_confidence = self.signal_gate.should_enter(self.config.side)
+            if not allowed:
+                return
+
         # Apply slippage to get realistic fill price
         fill_price = signal_price
         slippage_pct = 0.0
@@ -434,8 +448,15 @@ class VectorBacktest:
 
         tp_pct = abs(tp_price - fill_price) / fill_price * 100.0
 
+        # Scale size by gate confidence
+        size_usdt = self.config.order_size_usdt * gate_confidence
+        if self.position_sizer is not None:
+            size_usdt = self.position_sizer.calculate_size(
+                [r.net_pnl_pct for r in self.results]
+            ) * gate_confidence
+
         pos = Position.new(
-            self.config.side, fill_price, self.config.order_size_usdt,
+            self.config.side, fill_price, size_usdt,
             ts_ns, tp_price, sl_price, tp_pct
         )
         self.state.positions.append(pos)

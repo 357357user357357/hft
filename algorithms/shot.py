@@ -23,6 +23,7 @@ from hft_types import (
 from data import AggTrade
 from slippage import SlippageModel
 from risk_management import PositionSizer
+from signal_gate import SignalGate
 
 
 @dataclass
@@ -55,7 +56,8 @@ class ShotState:
 class ShotBacktest:
     def __init__(self, config: ShotConfig, slippage: Optional[SlippageModel] = None,
                  maker_fee_pct: float = 0.02, taker_fee_pct: float = 0.05,
-                 use_taker_fee: bool = True, position_sizer: Optional[PositionSizer] = None):
+                 use_taker_fee: bool = True, position_sizer: Optional[PositionSizer] = None,
+                 signal_gate: Optional[SignalGate] = None):
         self.config = config
         self.state = ShotState()
         self.results: List[TradeResult] = []
@@ -65,12 +67,17 @@ class ShotBacktest:
         self.taker_fee_pct = taker_fee_pct
         self.use_taker_fee = use_taker_fee
         self.position_sizer = position_sizer
+        self.signal_gate = signal_gate
         self._last_entry_slippage: float = 0.0
         self._last_entry_ts: Optional[int] = None
 
     def on_trade(self, trade: AggTrade) -> None:
         price = trade.price
         ts_ns = trade.timestamp_ns()
+
+        # Feed the signal gate
+        if self.signal_gate is not None:
+            self.signal_gate.on_trade(price, trade.quantity, ts_ns)
 
         if self.state.position is not None:
             self._check_position(price, ts_ns)
@@ -152,6 +159,13 @@ class ShotBacktest:
         self.state.near_boundary_crossed_at = None
 
     def _open_position(self, signal_price: float, ts_ns: int) -> None:
+        # Signal gate check
+        gate_confidence = 1.0
+        if self.signal_gate is not None:
+            allowed, gate_confidence = self.signal_gate.should_enter(self.config.side)
+            if not allowed:
+                return
+
         # Calculate position size using sizer if available
         if self.position_sizer is not None:
             size_usdt = self.position_sizer.calculate_size(
@@ -159,6 +173,9 @@ class ShotBacktest:
             )
         else:
             size_usdt = self.config.order_size_usdt
+
+        # Scale by signal gate confidence
+        size_usdt *= gate_confidence
 
         # Apply slippage to get realistic fill price
         fill_price = signal_price

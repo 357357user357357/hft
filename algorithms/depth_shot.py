@@ -16,6 +16,7 @@ from hft_types import (
 )
 from data import AggTrade, SimpleOrderBook
 from slippage import SlippageModel
+from signal_gate import SignalGate
 
 
 class DepthTpMode:
@@ -113,7 +114,8 @@ class DepthShotState:
 class DepthShotBacktest:
     def __init__(self, config: DepthShotConfig, slippage: Optional[SlippageModel] = None,
                  maker_fee_pct: float = 0.02, taker_fee_pct: float = 0.05,
-                 use_taker_fee: bool = True):
+                 use_taker_fee: bool = True, position_sizer: Optional["PositionSizer"] = None,
+                 signal_gate: Optional[SignalGate] = None):
         self.config = config
         self.state = DepthShotState()
         self.results: List[TradeResult] = []
@@ -122,11 +124,17 @@ class DepthShotBacktest:
         self.maker_fee_pct = maker_fee_pct
         self.taker_fee_pct = taker_fee_pct
         self.use_taker_fee = use_taker_fee
+        self.position_sizer = position_sizer
+        self.signal_gate = signal_gate
         self._last_entry_slippage: float = 0.0
 
     def on_trade(self, trade: AggTrade, book: SimpleOrderBook) -> None:
         price = trade.price
         ts_ns = trade.timestamp_ns()
+
+        # Feed the signal gate
+        if self.signal_gate is not None:
+            self.signal_gate.on_trade(price, trade.quantity, ts_ns)
 
         self.state.push_price(ts_ns, price)
 
@@ -227,6 +235,13 @@ class DepthShotBacktest:
             self.state.near_boundary_crossed_at = None
 
     def _open_position(self, signal_price: float, ts_ns: int) -> None:
+        # Signal gate check
+        gate_confidence = 1.0
+        if self.signal_gate is not None:
+            allowed, gate_confidence = self.signal_gate.should_enter(self.config.side)
+            if not allowed:
+                return
+
         # Apply slippage to get realistic fill price
         fill_price = signal_price
         slippage_pct = 0.0
@@ -253,8 +268,15 @@ class DepthShotBacktest:
 
         tp_pct = abs(tp_price - fill_price) / fill_price * 100.0
 
+        # Scale size by gate confidence
+        size_usdt = self.config.order_size_usdt * gate_confidence
+        if self.position_sizer is not None:
+            size_usdt = self.position_sizer.calculate_size(
+                [r.net_pnl_pct for r in self.results]
+            ) * gate_confidence
+
         self.state.position = Position.new(
-            self.config.side, fill_price, self.config.order_size_usdt,
+            self.config.side, fill_price, size_usdt,
             ts_ns, tp_price, sl_price, tp_pct
         )
         self.state.order_price = None
