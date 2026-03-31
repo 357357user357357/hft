@@ -1,5 +1,8 @@
 # HFT Backtest Framework - Core Dependencies
 # Python >= 3.11 required
+#
+# NOTE: Most math modules are pure Python with NO external dependencies.
+#       Install only what you need for your use case.
 
 # Testing
 pytest>=7.0.0
@@ -9,6 +12,10 @@ pytest>=7.0.0
 
 # Topology (optional, for whitehead_signal.py)
 # gudhi>=3.8.0       # Persistent homology / Whitehead torsion
+
+# Hecke operators work WITHOUT SageMath (uses pure-Python groebner.py).
+# SageMath is OPTIONAL for faster Gröbner basis (F4/F5) and modular form validation:
+# sageall>=9.0       # SageMath (optional, heavy ~2GB install)
 
 # LLM Agents (optional, for agents/)
 # openai>=1.0.0      # vLLM + OpenAI API compatible clients
