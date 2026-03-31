@@ -35,6 +35,23 @@ from .sentiment_agent import SentimentSignal
 from .news_agent import NewsSignal
 from .fundamental_agent import FundamentalSignal
 
+# Try to import central weights, fallback to inline if not available
+try:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from signal_weights import AGENT_INTEGRATION_WEIGHTS
+except ImportError:
+    # Fallback weights (must match signal_weights.py)
+    AGENT_INTEGRATION_WEIGHTS = {
+        "poincare": 0.25,
+        "whitehead": 0.15,
+        "hecke": 0.10,
+        "sentiment": 0.20,
+        "news": 0.15,
+        "fundamental": 0.15,
+    }
+
 
 @dataclass
 class CombinedSignal:

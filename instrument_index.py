@@ -359,7 +359,9 @@ class InstrumentScorecard:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dimension weights  (must sum to 1.0)
+# Dimension weights (must sum to 1.0)
+# Kept inline for clarity and standalone use.
+# Also exported to signal_weights.py for cross-module consistency.
 # ─────────────────────────────────────────────────────────────────────────────
 _WEIGHTS: Dict[str, float] = {
     # math

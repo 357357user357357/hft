@@ -1,0 +1,27 @@
+# HFT Backtest Framework - Core Dependencies
+# Python >= 3.11 required
+
+# Testing
+pytest>=7.0.0
+
+# Graph analysis (optional, for graph_trades.py)
+# rustworkx>=0.13.0  # Fast graph library (optional, can use networkx fallback)
+
+# Topology (optional, for whitehead_signal.py)
+# gudhi>=3.8.0       # Persistent homology / Whitehead torsion
+
+# LLM Agents (optional, for agents/)
+# openai>=1.0.0      # vLLM + OpenAI API compatible clients
+# anthropic>=0.18.0  # Claude API
+# ollama>=0.1.0      # Local Ollama inference
+
+# Data fetching for agents (optional)
+# tweepy>=4.0.0      # Twitter/X API
+# praw>=7.0.0        # Reddit API
+# yfinance>=0.2.0    # Yahoo Finance for fundamentals
+
+# ML Training (optional, for research/)
+# torch>=2.0.0       # PyTorch for transformer training
+
+# Note: Most math modules are pure Python with no external dependencies.
+#       Only install what you need for your use case.
