@@ -319,4 +319,6 @@ pytest --cov=. --cov-report=html
 
 ## License
 
-MIT
+This project is released under **The Unlicense** — see [LICENSE](LICENSE) for details.
+
+In short: **Do whatever you want with this code. No warranty. No restrictions.**
