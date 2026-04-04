@@ -238,7 +238,7 @@ class RegimeDetector:
 
         # Run Fel semigroup analysis
         try:
-            report = self._fel_signal.analyze(prices)
+            report = self._fel_signal.eval(prices)
             self._last_report = report
         except Exception:
             logger.warning("Regime detection failed, defaulting to NEUTRAL", exc_info=True)

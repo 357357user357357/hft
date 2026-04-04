@@ -533,6 +533,59 @@ class InstrumentIndexer:
         self._cards[symbol] = card
         return card
 
+    def compute_signal(
+        self,
+        signal_type: str,
+        prices: List[float],
+        volumes: Optional[List[float]] = None,
+        symbol: str = "SYMBOL",
+    ) -> float:
+        """Compute only one signal score — avoids running all 19 for backtesting."""
+        sig = signal_type.lower()
+        if sig == "composite":
+            return self.update(symbol, prices, volumes).composite
+        elif sig in ("poincare", "topology"):
+            return self._compute_topology(prices, embed_dim=3, subsample=60).score
+        elif sig == "torsion":
+            return self._compute_torsion(prices, embed_dim=3, subsample=60).score
+        elif sig == "algebraic":
+            idx = self._compute_algebraic(prices)
+            return idx.score * idx.direction
+        elif sig == "geometry":
+            return self._compute_geometry(prices, volumes).score
+        elif sig == "polar":
+            return self._compute_polar(prices).score
+        elif sig == "number_theory":
+            return self._compute_number_theory(prices).score
+        elif sig == "graph":
+            return self._compute_graph(prices, None).score
+        elif sig == "spectral":
+            return self._compute_spectral(prices).score
+        elif sig == "fel":
+            return self._compute_fel(prices).score
+        elif sig == "quaternion":
+            return self._compute_quaternion(symbol, prices, volumes).score
+        elif sig == "simons":
+            return self._compute_simons(prices).score
+        elif sig == "hurst":
+            return HurstResult.compute(prices).score
+        elif sig == "volatility":
+            return VolatilityResult.compute(prices).score
+        elif sig == "order_flow":
+            return OrderFlowResult.compute(prices, volumes, None).score
+        elif sig == "volume_profile":
+            return VolumeProfileResult.compute(prices, volumes).score
+        elif sig == "microstructure":
+            return MicrostructureResult.compute(prices, volumes).score
+        elif sig == "momentum":
+            return MomentumResult.compute(prices).score
+        elif sig == "autocorr":
+            return AutocorrResult.compute(prices).score
+        elif sig == "funding":
+            return FundingProxyResult.compute(prices).score
+        else:
+            return self.update(symbol, prices, volumes).composite
+
     def get(self, symbol: str) -> Optional[InstrumentScorecard]:
         return self._cards.get(symbol)
 

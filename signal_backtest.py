@@ -182,8 +182,9 @@ class SignalBacktest:
             window_volumes = volumes[max(0, i - self.config.lookback_bars):i + 1]
 
             try:
-                card = self._indexer.update("SYMBOL", window_prices, window_volumes)
-                score = self._extract_score(card)
+                score = self._indexer.compute_signal(
+                    self.config.signal_type, window_prices, window_volumes
+                )
             except Exception:
                 score = 0.0
 
