@@ -233,44 +233,44 @@ class RegimeDetector:
         if len(trades) < min_trades:
             return MarketRegime.NEUTRAL
 
-        # Extract prices for Fel analysis
         prices = [t.price for t in trades[-min_trades:]]
 
-        # Run Fel semigroup analysis
+        # ── Primary: direct statistical regime test ───────────────────────
+        # Lag-1 autocorrelation of returns: negative = mean-reverting,
+        # positive = trending.  More robust than FEL on short windows.
+        try:
+            rets = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+            n    = len(rets)
+            mean_r = sum(rets) / n
+            lag1_cov = sum((rets[i] - mean_r) * (rets[i-1] - mean_r)
+                           for i in range(1, n))
+            var_r    = sum((r - mean_r)**2 for r in rets)
+            autocorr = lag1_cov / var_r if var_r > 0 else 0.0
+        except Exception:
+            autocorr = 0.0
+
+        # ── Secondary: FEL semigroup (enriches borderline cases) ──────────
         try:
             report = self._fel_signal.eval(prices)
             self._last_report = report
+            fel_regime = report.regime   # "mean-reversion" | "trending" | "neutral"
         except Exception:
-            logger.warning("Regime detection failed, defaulting to NEUTRAL", exc_info=True)
-            return MarketRegime.NEUTRAL
+            logger.debug("FEL eval failed in regime detection", exc_info=True)
+            fel_regime = "neutral"
 
-        # Get semigroup properties
-        semigroup = report.semigroup
-        genus = semigroup.genus
-        generators = semigroup.generators
-        min_gen = min(generators) if generators else 0
-
-        # Calculate K-ratio (K_2 / K_0) for trending detection
-        k_0 = report.k_invariants.get(0, 1.0)
-        k_2 = report.k_invariants.get(2, 1.0)
-        k_ratio = k_2 / k_0 if k_0 > 0 else 1.0
-
-        # Get maximum discrepancy
-        max_disc = max(report.discrepancies.values()) if report.discrepancies else 0.0
-
-        # Regime detection logic
-        if genus == 0:
+        # ── Decision: autocorrelation is primary, FEL breaks ties ─────────
+        if autocorr < -0.05:
             regime = MarketRegime.MEAN_REVERSION
-        elif genus <= self.config.low_genus_threshold and min_gen <= self.config.min_generator_trending:
-            regime = MarketRegime.MEAN_REVERSION
-        elif genus > self.config.high_genus_threshold and k_ratio > self.config.k_ratio_trending:
-            regime = MarketRegime.TRENDING
-        elif max_disc > self.config.discrepancy_threshold:
-            regime = MarketRegime.MEAN_REVERSION
-        elif genus > 10:
+        elif autocorr > 0.05:
             regime = MarketRegime.TRENDING
         else:
-            regime = MarketRegime.NEUTRAL
+            # Borderline — use FEL
+            if fel_regime == "trending":
+                regime = MarketRegime.TRENDING
+            elif fel_regime == "mean-reversion":
+                regime = MarketRegime.MEAN_REVERSION
+            else:
+                regime = MarketRegime.NEUTRAL
 
         self._last_regime = regime
         return regime

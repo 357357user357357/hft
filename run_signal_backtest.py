@@ -1,110 +1,220 @@
 #!/usr/bin/env python3
-"""Run signal backtest on real BTC data."""
+"""Signal backtest — parallel across instruments AND signals.
 
+Runs every (instrument × signal) combination concurrently using
+ProcessPoolExecutor so all CPU cores are used.
+
+Usage:
+    python run_signal_backtest.py                          # all data/*.zip
+    python run_signal_backtest.py --symbol BTCUSDT ETHUSDT
+    python run_signal_backtest.py --workers 8
+"""
+
+from __future__ import annotations
+
+import argparse
 import sys
-sys.path.insert(0, '.')
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+sys.path.insert(0, os.path.dirname(__file__))
 
 from data import load_agg_trades_csv
-from signal_backtest import SignalBacktest, SignalConfig, compare_signals
-from pathlib import Path
+from signal_backtest import SignalBacktest, SignalConfig, SignalStats
 
-# Load real BTC data
-data_file = Path("./data/BTCUSDT-aggTrades-2024-01-15.zip")
-print(f"Loading {data_file.name}...")
-
-trades = load_agg_trades_csv(data_file)
-print(f"Loaded {len(trades):,} trades")
-
-# Extract prices and volumes
-prices = [t.price for t in trades]
-volumes = [t.quantity for t in trades]
-
-print(f"Price range: {min(prices):.2f} - {max(prices):.2f}")
-print(f"Date range: {trades[0].transact_time} to {trades[-1].transact_time}")
-
-# Downsample to 1-minute bars for faster backtesting
-def resample_to_bars(prices, volumes, bar_size=60):
-    """Resample tick data to bars."""
-    bar_prices = []
-    bar_volumes = []
-    for i in range(0, len(prices), bar_size):
-        end = min(i + bar_size, len(prices))
-        bar_prices.append((prices[i] + prices[end-1]) / 2)  # Average price
-        bar_volumes.append(sum(volumes[i:end]))
-    return bar_prices, bar_volumes
-
-print("\nResampling to 1-minute bars...")
-bar_prices, bar_volumes = resample_to_bars(prices, volumes, bar_size=60)
-print(f"Created {len(bar_prices)} bars")
-
-# Run individual signal backtests
-print("\n" + "="*70)
-print("INDIVIDUAL SIGNAL BACKTESTS")
-print("="*70)
-
-signals_to_test = [
-    ("composite", "Composite (all 19 dims)"),
-    ("poincare", "Poincaré Topology"),
-    ("torsion", "Whitehead Torsion"),
-    ("geometry", "Frenet-Serret Geometry"),
-    ("polar", "Polar Coordinates"),
-    ("hurst", "Hurst Exponent"),
-    ("momentum", "Momentum/RSI"),
-    ("simons", "Jim Simons SDEs"),
-    ("spectral", "Spectral Analysis"),
-    ("fel", "FEL Semigroup"),
+SIGNALS: List[Tuple[str, str]] = [
+    ("composite",  "Composite (all 19)"),
+    ("poincare",   "Poincaré Topology"),
+    ("torsion",    "Whitehead Torsion"),
+    ("geometry",   "Frenet-Serret"),
+    ("polar",      "Polar Coords"),
+    ("hurst",      "Hurst Exponent"),
+    ("momentum",   "Momentum/RSI"),
+    ("simons",     "Simons SDEs"),
+    ("spectral",   "Spectral/Hecke"),
+    ("fel",        "FEL Semigroup"),
+    ("order_flow", "Order Flow"),
+    ("autocorr",   "Autocorrelation"),
+    ("volatility", "Volatility"),
+    ("quaternion", "Quaternion"),
 ]
 
-results = []
-for sig_key, sig_name in signals_to_test:
-    print(f"\nTesting {sig_name}...")
-    config = SignalConfig(
+
+# ── worker (runs in subprocess) ───────────────────────────────────────────────
+
+def _run_one(
+    symbol: str,
+    zip_path: str,
+    sig_key: str,
+    lookback: int,
+    hold: int,
+    threshold: float,
+    bar_size: int,
+) -> Tuple[str, str, SignalStats]:
+    """One (symbol, signal) combination. Runs in a worker process."""
+    from data import load_agg_trades_csv
+    from signal_backtest import SignalBacktest, SignalConfig
+
+    trades = load_agg_trades_csv(zip_path)
+    prices  = [t.price    for t in trades]
+    volumes = [t.quantity for t in trades]
+
+    # Resample tick data → bars
+    bp, bv = [], []
+    for i in range(0, len(prices), bar_size):
+        end = min(i + bar_size, len(prices))
+        bp.append((prices[i] + prices[end - 1]) / 2)
+        bv.append(sum(volumes[i:end]))
+
+    cfg = SignalConfig(
         signal_type=sig_key,
-        lookback_bars=50,
-        hold_bars=10,
-        threshold=0.12,
+        lookback_bars=lookback,
+        hold_bars=hold,
+        threshold=threshold,
         allow_long=True,
         allow_short=True,
     )
-    backtest = SignalBacktest(config)
-    stats = backtest.run(bar_prices, bar_volumes)
-    results.append((sig_key, sig_name, stats))
+    stats = SignalBacktest(cfg).run(bp, bv)
+    return symbol, sig_key, stats
 
-    print(f"  {sig_name:30s}: "
-          f"trades={stats.total_trades:3d}  "
-          f"win={stats.win_rate*100:5.1f}%  "
-          f"pnl={stats.total_pnl_pct:+7.2f}%  "
-          f"sharpe={stats.sharpe_ratio:6.2f}")
 
-# Rank by Sharpe ratio
-print("\n" + "="*70)
-print("SIGNALS RANKED BY SHARPE RATIO")
-print("="*70)
+# ── main ──────────────────────────────────────────────────────────────────────
 
-ranked = sorted(results, key=lambda x: x[2].sharpe_ratio, reverse=True)
-for rank, (sig_key, sig_name, stats) in enumerate(ranked, 1):
-    print(f"  {rank:2d}. {sig_name:30s} Sharpe={stats.sharpe_ratio:6.2f}  "
-          f"win={stats.win_rate*100:5.1f}%  "
-          f"pnl={stats.total_pnl_pct:+7.2f}%")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Parallel signal backtest across instruments")
+    parser.add_argument("--symbol", nargs="+",
+                        help="Symbols to test (default: all ZIPs in ./data/)")
+    parser.add_argument("--data-dir",  default="./data")
+    parser.add_argument("--lookback",  type=int,   default=50)
+    parser.add_argument("--hold",      type=int,   default=10)
+    parser.add_argument("--threshold", type=float, default=0.12)
+    parser.add_argument("--bar-size",  type=int,   default=60,
+                        help="Ticks per bar (default 60)")
+    parser.add_argument("--workers",   type=int,   default=None,
+                        help="Worker processes (default: cpu_count)")
+    args = parser.parse_args()
 
-# Print detailed stats for top 3
-print("\n" + "="*70)
-print("TOP 3 SIGNALS - DETAILED STATS")
-print("="*70)
+    data_dir = Path(args.data_dir)
+    if args.symbol:
+        files = {sym: data_dir / f"{sym}-aggTrades-2024-01-15.zip"
+                 for sym in args.symbol}
+        files = {k: v for k, v in files.items() if v.exists()}
+    else:
+        files = {}
+        for z in sorted(data_dir.glob("*-aggTrades-*.zip")):
+            sym = z.name.split("-aggTrades-")[0]
+            files[sym] = z
 
-for sig_key, sig_name, stats in ranked[:3]:
-    stats.print_summary(f"{sig_name} ({sig_key})")
+    if not files:
+        print("No data files found. Run download_data.py first.")
+        sys.exit(1)
 
-# Save results to file
-output_file = Path("./signal_backtest_results.txt")
-with open(output_file, "w") as f:
-    f.write("SIGNAL BACKTEST RESULTS - BTCUSDT 2024-01-15\n")
-    f.write("="*70 + "\n\n")
-    f.write("SIGNALS RANKED BY SHARPE RATIO\n")
-    f.write("="*70 + "\n")
-    for rank, (sig_key, sig_name, stats) in enumerate(ranked, 1):
-        f.write(f"{rank:2d}. {sig_name:30s} Sharpe={stats.sharpe_ratio:6.2f}  "
-                f"win={stats.win_rate*100:5.1f}%  "
-                f"pnl={stats.total_pnl_pct:+7.2f}%\n")
+    symbols = sorted(files)
+    total_jobs = len(symbols) * len(SIGNALS)
+    print(f"Running {len(symbols)} instruments × {len(SIGNALS)} signals "
+          f"= {total_jobs} jobs in parallel\n"
+          f"Symbols: {', '.join(symbols)}\n")
 
-print(f"\nResults saved to {output_file}")
+    # Submit all (symbol, signal) pairs at once
+    results: Dict[str, Dict[str, SignalStats]] = {s: {} for s in symbols}
+    completed = 0
+
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        futures = {
+            pool.submit(
+                _run_one,
+                sym, str(files[sym]),
+                sig_key,
+                args.lookback, args.hold, args.threshold, args.bar_size,
+            ): (sym, sig_key, sig_name)
+            for sym in symbols
+            for sig_key, sig_name in SIGNALS
+        }
+
+        for fut in as_completed(futures):
+            sym, sig_key, sig_name = futures[fut]
+            completed += 1
+            try:
+                _, _, stats = fut.result()
+                results[sym][sig_key] = stats
+                print(f"  [{completed:>3}/{total_jobs}] {sym:<10} {sig_name:<22} "
+                      f"trades={stats.total_trades:3d}  "
+                      f"win={stats.win_rate*100:5.1f}%  "
+                      f"pnl={stats.total_pnl_pct:+7.3f}%  "
+                      f"sharpe={stats.sharpe_ratio:6.2f}",
+                      flush=True)
+            except Exception as e:
+                print(f"  [{completed:>3}/{total_jobs}] {sym:<10} {sig_name:<22} ERROR: {e}",
+                      flush=True)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    sig_map = dict(SIGNALS)
+
+    print("\n\n" + "=" * 90)
+    print("BEST INSTRUMENT PER SIGNAL  (by Sharpe)")
+    print("=" * 90)
+    for sig_key, sig_name in SIGNALS:
+        row = [(sym, results[sym][sig_key])
+               for sym in symbols
+               if sig_key in results[sym] and results[sym][sig_key].total_trades > 0]
+        if not row:
+            continue
+        row.sort(key=lambda x: x[1].sharpe_ratio, reverse=True)
+        best_sym, s = row[0]
+        print(f"  {sig_name:<22} → {best_sym:<10}  "
+              f"sharpe={s.sharpe_ratio:6.2f}  pnl={s.total_pnl_pct:+7.3f}%  "
+              f"win={s.win_rate*100:5.1f}%  trades={s.total_trades}")
+
+    print("\n" + "=" * 90)
+    print("BEST SIGNAL PER INSTRUMENT  (by Sharpe)")
+    print("=" * 90)
+    for sym in symbols:
+        ranked = sorted(
+            [(k, v) for k, v in results[sym].items() if v.total_trades > 0],
+            key=lambda x: x[1].sharpe_ratio, reverse=True,
+        )
+        if not ranked:
+            continue
+        best_k, s = ranked[0]
+        print(f"  {sym:<10} → {sig_map[best_k]:<22}  "
+              f"sharpe={s.sharpe_ratio:6.2f}  pnl={s.total_pnl_pct:+7.3f}%  "
+              f"win={s.win_rate*100:5.1f}%  trades={s.total_trades}")
+
+    print("\n" + "=" * 90)
+    print("ALL INSTRUMENTS — RANKED BY TOTAL PnL (sum across all signals)")
+    print("=" * 90)
+    ranking = []
+    for sym in symbols:
+        sigs = results[sym]
+        total_pnl   = sum(s.total_pnl_pct   for s in sigs.values() if s.total_trades > 0)
+        best_sharpe = max((s.sharpe_ratio    for s in sigs.values() if s.total_trades > 0), default=0.0)
+        total_trades = sum(s.total_trades    for s in sigs.values())
+        ranking.append((sym, total_pnl, best_sharpe, total_trades))
+    ranking.sort(key=lambda x: x[1], reverse=True)
+    for sym, pnl, sharpe, trades in ranking:
+        bar = "█" * min(int(abs(pnl) * 1.5), 40)
+        print(f"  {sym:<10}  pnl={pnl:+8.3f}%  best_sharpe={sharpe:6.2f}  "
+              f"trades={trades:4d}  {bar}")
+
+    # ── Per-instrument top-3 signals ──────────────────────────────────────────
+    print("\n" + "=" * 90)
+    print("TOP 3 SIGNALS PER INSTRUMENT")
+    print("=" * 90)
+    for sym in symbols:
+        ranked = sorted(
+            [(k, v) for k, v in results[sym].items() if v.total_trades > 0],
+            key=lambda x: x[1].sharpe_ratio, reverse=True,
+        )[:3]
+        if not ranked:
+            continue
+        print(f"\n  {sym}:")
+        for i, (k, s) in enumerate(ranked, 1):
+            print(f"    {i}. {sig_map[k]:<22}  sharpe={s.sharpe_ratio:6.2f}  "
+                  f"pnl={s.total_pnl_pct:+7.3f}%  win={s.win_rate*100:5.1f}%  "
+                  f"trades={s.total_trades}")
+
+
+if __name__ == "__main__":
+    main()
