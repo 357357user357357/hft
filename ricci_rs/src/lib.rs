@@ -492,6 +492,237 @@ fn hmm_vol_fit(
     Ok((var0, var1, p01, p10, alpha[n-1][0]))
 }
 
+// ── Pair Arbitrage: Kalman filter spread tracker ─────────────────────────────
+//
+// Statistical pair arbitrage requires tracking a time-varying hedge ratio β
+// and the residual spread  s_t = y_t − β·x_t  in real time.
+//
+// We use a 1-D Kalman filter (local-level model) to estimate β online:
+//   State:      β_t  (hedge ratio, scalar)
+//   Transition: β_t = β_{t-1} + w_t,   w_t ~ N(0, Q)   (random walk)
+//   Observation:y_t = β_t·x_t + v_t,   v_t ~ N(0, R)   (measurement)
+//
+// After each update we return the spread z-score so Python can decide
+// whether to enter/exit a mean-reversion trade.
+//
+// kalman_pair_update(beta, P, y, x, Q, R)
+//   -> (beta_new, P_new, spread, spread_zscore, kalman_gain)
+//
+// kalman_pair_batch(ys, xs, Q, R)
+//   -> (betas, Ps, spreads)   — full history for backtest
+//
+// pair_zscore(spreads, window)
+//   -> (zscores, mean, std)   — rolling z-score of spread series
+//
+// engle_granger_coint(ys, xs)
+//   -> (beta_ols, resid_adf_stat, coint_pvalue_approx)
+//   Approx ADF on the OLS residuals; fast, no scipy needed.
+
+/// Single Kalman filter step for pair hedge-ratio tracking.
+///
+/// Arguments:
+///   beta  – current hedge ratio estimate
+///   p     – current error covariance
+///   y     – price of leg-A at this bar
+///   x     – price of leg-B at this bar
+///   q     – process noise variance (controls how fast β can drift)
+///   r     – observation noise variance (measurement error)
+///
+/// Returns: (beta_new, p_new, spread, gain)
+#[pyfunction]
+#[pyo3(signature = (beta, p, y, x, q=1e-5, r=1e-3))]
+fn kalman_pair_update(
+    _py: Python<'_>,
+    beta: f64,
+    p: f64,
+    y: f64,
+    x: f64,
+    q: f64,
+    r: f64,
+) -> PyResult<(f64, f64, f64, f64)> {
+    // Predict
+    let p_pred = p + q;
+    // Innovation (spread before update)
+    let spread = y - beta * x;
+    // Innovation variance
+    let s = p_pred * x * x + r;
+    // Kalman gain
+    let gain = if s.abs() < 1e-30 { 0.0 } else { p_pred * x / s };
+    // Update
+    let beta_new = beta + gain * spread;
+    let p_new    = (1.0 - gain * x) * p_pred;
+    // Spread after update (residual with new β)
+    let spread_new = y - beta_new * x;
+    Ok((beta_new, p_new.max(1e-12), spread_new, gain))
+}
+
+/// Run Kalman filter over full price history (batch, for backtest).
+///
+/// Arguments:
+///   ys  – price series for leg-A  (length N)
+///   xs  – price series for leg-B  (length N)
+///   q   – process noise
+///   r   – observation noise
+///
+/// Returns: (betas, p_vars, spreads)  — each length N
+#[pyfunction]
+#[pyo3(signature = (ys, xs, q=1e-5, r=1e-3))]
+fn kalman_pair_batch(
+    _py: Python<'_>,
+    ys: Vec<f64>,
+    xs: Vec<f64>,
+    q: f64,
+    r: f64,
+) -> PyResult<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+    let n = ys.len().min(xs.len());
+    if n == 0 {
+        return Ok((vec![], vec![], vec![]));
+    }
+
+    let mut betas   = Vec::with_capacity(n);
+    let mut p_vars  = Vec::with_capacity(n);
+    let mut spreads = Vec::with_capacity(n);
+
+    // Initialise: OLS estimate on first 20 points (or n if shorter)
+    let init = n.min(20);
+    let sx: f64  = xs[..init].iter().sum();
+    let sy: f64  = ys[..init].iter().sum();
+    let sxx: f64 = xs[..init].iter().map(|x| x*x).sum();
+    let sxy: f64 = xs[..init].iter().zip(ys[..init].iter()).map(|(x,y)| x*y).sum();
+    let denom = sxx - sx*sx / init as f64;
+    let mut beta = if denom.abs() > 1e-12 {
+        (sxy - sx*sy / init as f64) / denom
+    } else { 1.0 };
+    let mut p = 1.0_f64;  // start with high uncertainty
+
+    for i in 0..n {
+        let x = xs[i]; let y = ys[i];
+        // Predict
+        let p_pred = p + q;
+        // Innovation
+        let spread = y - beta * x;
+        // Innovation variance
+        let innov_var = p_pred * x * x + r;
+        // Kalman gain
+        let gain = if innov_var.abs() < 1e-30 { 0.0 } else { p_pred * x / innov_var };
+        // Update
+        beta = beta + gain * spread;
+        p    = ((1.0 - gain * x) * p_pred).max(1e-12);
+        spreads.push(y - beta * x);
+        betas.push(beta);
+        p_vars.push(p);
+    }
+
+    Ok((betas, p_vars, spreads))
+}
+
+/// Rolling z-score of a spread series.
+///
+/// Arguments:
+///   spreads – raw spread values (length N)
+///   window  – lookback window for mean/std (default 60)
+///
+/// Returns: (zscores, rolling_mean, rolling_std)  — each length N
+/// Points before window is full return z=0.
+#[pyfunction]
+#[pyo3(signature = (spreads, window=60))]
+fn pair_zscore(
+    _py: Python<'_>,
+    spreads: Vec<f64>,
+    window: usize,
+) -> PyResult<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+    let n = spreads.len();
+    let w = window.max(2);
+    let mut zscores = vec![0.0f64; n];
+    let mut means   = vec![0.0f64; n];
+    let mut stds    = vec![0.0f64; n];
+
+    for i in 0..n {
+        let start = if i + 1 >= w { i + 1 - w } else { 0 };
+        let slice = &spreads[start..=i];
+        let len = slice.len() as f64;
+        let mean = slice.iter().sum::<f64>() / len;
+        let var  = slice.iter().map(|s| (s - mean) * (s - mean)).sum::<f64>() / len;
+        let std  = var.sqrt();
+        means[i] = mean;
+        stds[i]  = std;
+        if i + 1 >= w && std > 1e-12 {
+            zscores[i] = (spreads[i] - mean) / std;
+        }
+    }
+
+    Ok((zscores, means, stds))
+}
+
+/// Engle-Granger cointegration test (approximate).
+///
+/// Fits OLS regression y ~ β·x, then runs approximate ADF on residuals.
+/// Returns (beta_ols, adf_stat, p_value_approx).
+///
+/// p_value_approx uses MacKinnon (1994) response surface for 1% / 5% / 10%:
+///   τ_1% ≈ -3.43,  τ_5% ≈ -2.86,  τ_10% ≈ -2.57   (for n→∞)
+/// We interpolate linearly.  Not exact but good enough for screening.
+#[pyfunction]
+fn engle_granger_coint(
+    _py: Python<'_>,
+    ys: Vec<f64>,
+    xs: Vec<f64>,
+) -> PyResult<(f64, f64, f64)> {
+    let n = ys.len().min(xs.len());
+    if n < 10 {
+        return Ok((1.0, 0.0, 1.0));
+    }
+
+    // OLS: β = Σ(x·y) / Σ(x²)  (no intercept — log-price ratio)
+    let sx:  f64 = xs[..n].iter().sum();
+    let sy:  f64 = ys[..n].iter().sum();
+    let sxx: f64 = xs[..n].iter().map(|v| v*v).sum();
+    let sxy: f64 = xs[..n].iter().zip(ys[..n].iter()).map(|(x,y)| x*y).sum();
+    let nf = n as f64;
+    let denom = sxx - sx*sx/nf;
+    let beta  = if denom.abs() > 1e-12 { (sxy - sx*sy/nf) / denom } else { 1.0 };
+    let alpha_intercept = (sy - beta*sx) / nf;
+
+    // Residuals
+    let resid: Vec<f64> = ys[..n].iter().zip(xs[..n].iter())
+        .map(|(&y, &x)| y - beta*x - alpha_intercept)
+        .collect();
+
+    // ADF(0): stat = (Σ e_t · Δe_t) / (σ · sqrt(Σ e_t²))
+    // where Δe_t = e_t - e_{t-1}
+    let mut sum_e2: f64 = 0.0;
+    let mut sum_e_de: f64 = 0.0;
+    for t in 1..n {
+        let e    = resid[t-1];
+        let de   = resid[t] - resid[t-1];
+        sum_e2  += e * e;
+        sum_e_de += e * de;
+    }
+
+    // Variance of Δe
+    let mean_de = resid.windows(2).map(|w| w[1]-w[0]).sum::<f64>() / (n-1) as f64;
+    let var_de  = resid.windows(2)
+        .map(|w| { let d = (w[1]-w[0]) - mean_de; d*d })
+        .sum::<f64>() / (n-2).max(1) as f64;
+
+    let denom2 = var_de.sqrt() * sum_e2.sqrt();
+    let adf_stat = if denom2 > 1e-30 { sum_e_de / denom2 } else { 0.0 };
+
+    // Approximate p-value via MacKinnon response surface (2-tail, no trend)
+    // Critical values at n→∞: 1%=-3.43, 5%=-2.86, 10%=-2.57
+    // Finite-sample correction: add c1/n + c2/n²
+    let tau1 = -3.43 + 3.39 / nf;
+    let tau5 = -2.86 + 2.74 / nf;
+    let tau10= -2.57 + 1.99 / nf;
+
+    let p_approx = if adf_stat < tau1 { 0.01 }
+        else if adf_stat < tau5  { 0.05 }
+        else if adf_stat < tau10 { 0.10 }
+        else                     { 0.50 };
+
+    Ok((beta, adf_stat, p_approx))
+}
+
 #[pymodule]
 fn ricci_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(wasserstein_1, m)?)?;
@@ -500,5 +731,10 @@ fn ricci_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ricci_flow, m)?)?;
     m.add_function(wrap_pyfunction!(hmm_regime_fit, m)?)?;
     m.add_function(wrap_pyfunction!(hmm_vol_fit, m)?)?;
+    // Pair arbitrage
+    m.add_function(wrap_pyfunction!(kalman_pair_update, m)?)?;
+    m.add_function(wrap_pyfunction!(kalman_pair_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(pair_zscore, m)?)?;
+    m.add_function(wrap_pyfunction!(engle_granger_coint, m)?)?;
     Ok(())
 }
