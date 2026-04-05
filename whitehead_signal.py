@@ -37,6 +37,7 @@ Requires: gudhi (MIT, pip install gudhi)
 
 from __future__ import annotations
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -45,6 +46,18 @@ try:
     _GUDHI_AVAILABLE = True
 except ImportError:
     _GUDHI_AVAILABLE = False
+
+import numpy as _np
+
+_xp = _np
+if os.environ.get("HFT_USE_GPU"):
+    try:
+        import cupy as _cupy
+        _probe = _cupy.array([1.0, 2.0])
+        _ = (_probe + _probe).get()
+        _xp = _cupy
+    except Exception:
+        pass
 
 from poincare_trading import (
     delay_embed, normalise_points, farthest_point_sampling,
@@ -453,12 +466,23 @@ def whitehead_analysis(
         points = farthest_point_sampling(points, subsample)
 
     n = len(points)
-    # Diameter of point cloud
-    flat_dists = [
-        math.sqrt(sum((points[i][d] - points[j][d]) ** 2 for d in range(len(points[0]))))
-        for i in range(n) for j in range(i + 1, n)
-    ]
-    diameter = max(flat_dists) if flat_dists else 1.0
+    # Diameter of point cloud — vectorised via NumPy/CuPy
+    try:
+        X = _xp.array(points, dtype=_xp.float64)
+        sq = _xp.einsum("ij,ij->i", X, X)
+        D2 = sq[:, None] + sq[None, :] - 2.0 * (X @ X.T)
+        D2 = _xp.maximum(D2, 0.0)
+        D_mat = _xp.sqrt(D2)
+        if _xp is not _np:
+            diameter = float(D_mat.get().max())
+        else:
+            diameter = float(D_mat.max())
+    except Exception:
+        flat_dists = [
+            math.sqrt(sum((points[i][d] - points[j][d]) ** 2 for d in range(len(points[0]))))
+            for i in range(n) for j in range(i + 1, n)
+        ]
+        diameter = max(flat_dists) if flat_dists else 1.0
     max_edge = max_edge_fraction * diameter
 
     # Persistent homology via gudhi

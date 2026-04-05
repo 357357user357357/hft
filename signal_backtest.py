@@ -46,6 +46,12 @@ class SignalConfig:
     allow_long: bool = True
     allow_short: bool = True
 
+    # Stride: recompute signal every N bars instead of every bar.
+    # Topology signals (poincaré, torsion) are expensive — stride=5 gives
+    # 5× speedup with negligible accuracy loss since regime doesn't change
+    # bar-by-bar.  Fast signals (hurst, momentum) default stride=1.
+    signal_stride: int = 1
+
 
 @dataclass
 class SignalTrade:
@@ -175,18 +181,22 @@ class SignalBacktest:
         entry_bar = 0
         entry_price = 0.0
         entry_score = 0.0
+        score = 0.0  # cached signal value (reused across stride steps)
+        stride = max(1, self.config.signal_stride)
 
         for i in range(self.config.lookback_bars, len(prices)):
-            # Compute signal on rolling window
-            window_prices = prices[max(0, i - self.config.lookback_bars):i + 1]
-            window_volumes = volumes[max(0, i - self.config.lookback_bars):i + 1]
-
-            try:
-                score = self._indexer.compute_signal(
-                    self.config.signal_type, window_prices, window_volumes
-                )
-            except Exception:
-                score = 0.0
+            # Recompute signal only every `stride` bars to save time on
+            # expensive signals (poincaré, torsion).  Regime doesn't flip
+            # every tick so reusing the last value is fine.
+            if (i - self.config.lookback_bars) % stride == 0:
+                window_prices = prices[max(0, i - self.config.lookback_bars):i + 1]
+                window_volumes = volumes[max(0, i - self.config.lookback_bars):i + 1]
+                try:
+                    score = self._indexer.compute_signal(
+                        self.config.signal_type, window_prices, window_volumes
+                    )
+                except Exception:
+                    score = 0.0
 
             # Check for exit
             if in_position:

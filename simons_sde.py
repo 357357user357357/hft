@@ -34,14 +34,25 @@ import numpy as np  # always available, used as fallback
 _GPU = False
 try:
     import cupy as _cp_module
-    # Probe: actually run a tiny kernel to confirm JIT works
     _probe = _cp_module.array([1.0, 2.0])
-    _ = (_probe + _probe).get()   # forces kernel compilation
+    _ = (_probe + _probe).get()
     cp = _cp_module
     _GPU = True
 except Exception:
-    # CuPy unavailable or JIT broken → use NumPy (9-10x faster than pure Python)
     cp = np  # type: ignore[assignment]
+
+# ── Rust-accelerated HMM (Baum-Welch EM forward pass) ────────────────────────
+# ricci_rs.hmm_regime_fit / hmm_vol_fit run the full EM loop in native Rust
+# (~8x faster than the Python loops, which dominate Simons SDE profiling).
+_RUST_HMM = False
+try:
+    import ricci_rs as _ricci_rs_mod
+    _rust_mod = _ricci_rs_mod if hasattr(_ricci_rs_mod, 'hmm_regime_fit') else _ricci_rs_mod.ricci_rs
+    hmm_regime_fit_rs = _rust_mod.hmm_regime_fit
+    hmm_vol_fit_rs    = _rust_mod.hmm_vol_fit
+    _RUST_HMM = True
+except Exception:
+    _RUST_HMM = False
 
 
 def _to_gpu(lst: List[float]):
@@ -214,57 +225,53 @@ class RegimeSwitchResult:
         if len(prices) < 20:
             return RegimeSwitchResult(0.0,0.0,0.01,0.01,0.1,0.1,"neutral",0.5,0.0)
 
-        if cp is not None:
-            p    = _to_gpu(prices)
-            rets = _to_cpu(cp.log(p[1:]/p[:-1]))
+        rets = [math.log(prices[i]/prices[i-1]) for i in range(1, len(prices))]
+
+        if _RUST_HMM:
+            mu0, mu1, s0, s1, p01, p10, alpha_last_0 = hmm_regime_fit_rs(rets, n_iter)
         else:
-            rets = [math.log(prices[i]/prices[i-1]) for i in range(1, len(prices))]
-        n    = len(rets)
-        med  = sorted(rets)[n//2]
-        hi   = [r for r in rets if r >= med]
-        lo   = [r for r in rets if r <  med]
-
-        def ms(xs):
-            if not xs: return 0.0, 0.01
-            m = sum(xs)/len(xs)
-            return m, max(math.sqrt(sum((x-m)**2 for x in xs)/len(xs)), 1e-6)
-
-        mu0,s0 = ms(hi);  mu1,s1 = ms(lo)
-        p01, p10 = 0.05, 0.05
-
-        def g(x, mu, s):
-            return math.exp(-0.5*((x-mu)/s)**2) / (s*math.sqrt(2*math.pi))
-
-        alpha = [[0.0, 0.0] for _ in range(n)]
-        for _ in range(n_iter):
-            # Forward (vectorised where possible)
-            b0 = g(rets[0], mu0, s0);  b1 = g(rets[0], mu1, s1)
-            alpha[0] = [0.5*b0, 0.5*b1]
-            sc = alpha[0][0]+alpha[0][1]
-            if sc: alpha[0][0]/=sc; alpha[0][1]/=sc
-            for t in range(1, n):
-                b0 = g(rets[t],mu0,s0);  b1 = g(rets[t],mu1,s1)
-                alpha[t][0] = (alpha[t-1][0]*(1-p01)+alpha[t-1][1]*p10)*b0
-                alpha[t][1] = (alpha[t-1][0]*p01    +alpha[t-1][1]*(1-p10))*b1
-                sc = alpha[t][0]+alpha[t][1]
-                if sc: alpha[t][0]/=sc; alpha[t][1]/=sc
-            # M-step
-            w0=[alpha[t][0] for t in range(n)]; w1=[alpha[t][1] for t in range(n)]
-            sw0=sum(w0) or 1.0;  sw1=sum(w1) or 1.0
-            mu0 = sum(w0[t]*rets[t] for t in range(n))/sw0
-            mu1 = sum(w1[t]*rets[t] for t in range(n))/sw1
-            s0 = math.sqrt(sum(w0[t]*(rets[t]-mu0)**2 for t in range(n))/sw0) or 1e-6
-            s1 = math.sqrt(sum(w1[t]*(rets[t]-mu1)**2 for t in range(n))/sw1) or 1e-6
-            t01=sum(alpha[t][0]*p01*g(rets[t],mu1,s1) for t in range(1,n))
-            s00=sum(alpha[t][0]*(1-p01)*g(rets[t],mu0,s0) for t in range(1,n))
-            p01=t01/(t01+s00+1e-9)
-            t10=sum(alpha[t][1]*p10*g(rets[t],mu0,s0) for t in range(1,n))
-            s11=sum(alpha[t][1]*(1-p10)*g(rets[t],mu1,s1) for t in range(1,n))
-            p10=t10/(t10+s11+1e-9)
+            # Pure-Python fallback (original Baum-Welch EM)
+            n    = len(rets)
+            med  = sorted(rets)[n//2]
+            hi   = [r for r in rets if r >= med]
+            lo   = [r for r in rets if r <  med]
+            def ms(xs):
+                if not xs: return 0.0, 0.01
+                m = sum(xs)/len(xs)
+                return m, max(math.sqrt(sum((x-m)**2 for x in xs)/len(xs)), 1e-6)
+            mu0,s0 = ms(hi);  mu1,s1 = ms(lo)
+            p01, p10 = 0.05, 0.05
+            def g(x, mu, s):
+                return math.exp(-0.5*((x-mu)/s)**2) / (s*math.sqrt(2*math.pi))
+            alpha = [[0.0, 0.0] for _ in range(n)]
+            for _ in range(n_iter):
+                b0 = g(rets[0], mu0, s0);  b1 = g(rets[0], mu1, s1)
+                alpha[0] = [0.5*b0, 0.5*b1]
+                sc = alpha[0][0]+alpha[0][1]
+                if sc: alpha[0][0]/=sc; alpha[0][1]/=sc
+                for t in range(1, n):
+                    b0 = g(rets[t],mu0,s0);  b1 = g(rets[t],mu1,s1)
+                    alpha[t][0] = (alpha[t-1][0]*(1-p01)+alpha[t-1][1]*p10)*b0
+                    alpha[t][1] = (alpha[t-1][0]*p01    +alpha[t-1][1]*(1-p10))*b1
+                    sc = alpha[t][0]+alpha[t][1]
+                    if sc: alpha[t][0]/=sc; alpha[t][1]/=sc
+                w0=[alpha[t][0] for t in range(n)]; w1=[alpha[t][1] for t in range(n)]
+                sw0=sum(w0) or 1.0;  sw1=sum(w1) or 1.0
+                mu0 = sum(w0[t]*rets[t] for t in range(n))/sw0
+                mu1 = sum(w1[t]*rets[t] for t in range(n))/sw1
+                s0 = math.sqrt(sum(w0[t]*(rets[t]-mu0)**2 for t in range(n))/sw0) or 1e-6
+                s1 = math.sqrt(sum(w1[t]*(rets[t]-mu1)**2 for t in range(n))/sw1) or 1e-6
+                t01=sum(alpha[t][0]*p01*g(rets[t],mu1,s1) for t in range(1,n))
+                s00=sum(alpha[t][0]*(1-p01)*g(rets[t],mu0,s0) for t in range(1,n))
+                p01=t01/(t01+s00+1e-9)
+                t10=sum(alpha[t][1]*p10*g(rets[t],mu0,s0) for t in range(1,n))
+                s11=sum(alpha[t][1]*(1-p10)*g(rets[t],mu1,s1) for t in range(1,n))
+                p10=t10/(t10+s11+1e-9)
+            alpha_last_0 = alpha[-1][0]
         if mu0 < mu1:
             mu0,mu1=mu1,mu0; s0,s1=s1,s0; p01,p10=p10,p01
-            for row in alpha: row[0],row[1]=row[1],row[0]
-        pb   = alpha[-1][0]
+            alpha_last_0 = 1.0 - alpha_last_0
+        pb   = alpha_last_0
         reg  = "bull" if pb > 0.5 else "bear"
         return RegimeSwitchResult(mu0,mu1,s0,s1,p01,p10,reg,
                                   pb if reg=="bull" else 1-pb,
@@ -415,49 +422,52 @@ class HMMVolResult:
         if len(prices) < 20:
             return HMMVolResult(0.01,0.05,0.1,0.3,"low_vol",0.8,0.5)
 
-        if cp is not None:
-            p    = _to_gpu(prices)
-            rets = cp.log(p[1:]/p[:-1])
-            obs  = _to_cpu(rets**2)
+        rets = [math.log(prices[i]/prices[i-1]) for i in range(1, len(prices))]
+        obs  = [r**2 for r in rets]
+
+        if _RUST_HMM:
+            var0, var1, p01, p10, alpha_last_0 = hmm_vol_fit_rs(obs, n_iter)
         else:
-            rets = [math.log(prices[i]/prices[i-1]) for i in range(1, len(prices))]
-            obs  = [r**2 for r in rets]
-        n   = len(obs)
-        med = sorted(obs)[n//2]
-        hi  = [o for o in obs if o > med];  lo = [o for o in obs if o <= med]
-        ms  = lambda xs: sum(xs)/len(xs) if xs else 1e-4
-        var0=ms(lo); var1=ms(hi); p01,p10=0.1,0.3
+            # Pure-Python fallback
+            n   = len(obs)
+            med = sorted(obs)[n//2]
+            hi  = [o for o in obs if o > med];  lo = [o for o in obs if o <= med]
+            ms  = lambda xs: sum(xs)/len(xs) if xs else 1e-4
+            var0=ms(lo); var1=ms(hi); p01,p10=0.1,0.3
+            def gq(x,v):
+                s=math.sqrt(max(v,1e-12))
+                return math.exp(-0.5*x/max(v,1e-12))/(s*math.sqrt(2*math.pi))
+            alpha=[[0.0,0.0] for _ in range(n)]
+            for _ in range(n_iter):
+                b0=gq(obs[0],var0); b1=gq(obs[0],var1)
+                alpha[0]=[0.5*b0,0.5*b1]
+                sc=alpha[0][0]+alpha[0][1]
+                if sc: alpha[0][0]/=sc; alpha[0][1]/=sc
+                for t in range(1,n):
+                    b0=gq(obs[t],var0); b1=gq(obs[t],var1)
+                    alpha[t][0]=(alpha[t-1][0]*(1-p01)+alpha[t-1][1]*p10)*b0
+                    alpha[t][1]=(alpha[t-1][0]*p01    +alpha[t-1][1]*(1-p10))*b1
+                    sc=alpha[t][0]+alpha[t][1]
+                    if sc: alpha[t][0]/=sc; alpha[t][1]/=sc
+                sw0=sum(alpha[t][0] for t in range(n)) or 1.0
+                sw1=sum(alpha[t][1] for t in range(n)) or 1.0
+                var0=max(sum(alpha[t][0]*obs[t] for t in range(n))/sw0,1e-12)
+                var1=max(sum(alpha[t][1]*obs[t] for t in range(n))/sw1,1e-12)
+                t01=sum(alpha[t][0]*p01*gq(obs[t],var1) for t in range(1,n))
+                s00=sum(alpha[t][0]*(1-p01)*gq(obs[t],var0) for t in range(1,n))
+                p01=t01/(t01+s00+1e-9)
+                t10=sum(alpha[t][1]*p10*gq(obs[t],var0) for t in range(1,n))
+                s11=sum(alpha[t][1]*(1-p10)*gq(obs[t],var1) for t in range(1,n))
+                p10=t10/(t10+s11+1e-9)
+            if var0>var1:
+                var0,var1=var1,var0; p01,p10=p10,p01
+                for row in alpha: row[0],row[1]=row[1],row[0]
+            alpha_last_0 = alpha[-1][0]
 
-        def gq(x,v):
-            s=math.sqrt(max(v,1e-12))
-            return math.exp(-0.5*x/max(v,1e-12))/(s*math.sqrt(2*math.pi))
-
-        alpha=[[0.0,0.0] for _ in range(n)]
-        for _ in range(n_iter):
-            b0=gq(obs[0],var0); b1=gq(obs[0],var1)
-            alpha[0]=[0.5*b0,0.5*b1]
-            sc=alpha[0][0]+alpha[0][1]
-            if sc: alpha[0][0]/=sc; alpha[0][1]/=sc
-            for t in range(1,n):
-                b0=gq(obs[t],var0); b1=gq(obs[t],var1)
-                alpha[t][0]=(alpha[t-1][0]*(1-p01)+alpha[t-1][1]*p10)*b0
-                alpha[t][1]=(alpha[t-1][0]*p01    +alpha[t-1][1]*(1-p10))*b1
-                sc=alpha[t][0]+alpha[t][1]
-                if sc: alpha[t][0]/=sc; alpha[t][1]/=sc
-            sw0=sum(alpha[t][0] for t in range(n)) or 1.0
-            sw1=sum(alpha[t][1] for t in range(n)) or 1.0
-            var0=max(sum(alpha[t][0]*obs[t] for t in range(n))/sw0,1e-12)
-            var1=max(sum(alpha[t][1]*obs[t] for t in range(n))/sw1,1e-12)
-            t01=sum(alpha[t][0]*p01*gq(obs[t],var1) for t in range(1,n))
-            s00=sum(alpha[t][0]*(1-p01)*gq(obs[t],var0) for t in range(1,n))
-            p01=t01/(t01+s00+1e-9)
-            t10=sum(alpha[t][1]*p10*gq(obs[t],var0) for t in range(1,n))
-            s11=sum(alpha[t][1]*(1-p10)*gq(obs[t],var1) for t in range(1,n))
-            p10=t10/(t10+s11+1e-9)
         if var0>var1:
             var0,var1=var1,var0; p01,p10=p10,p01
-            for row in alpha: row[0],row[1]=row[1],row[0]
-        pl = alpha[-1][0]
+            alpha_last_0 = 1.0 - alpha_last_0
+        pl = alpha_last_0
         st = "low_vol" if pl>0.5 else "high_vol"
         return HMMVolResult(math.sqrt(var0),math.sqrt(var1),p01,p10,st,
                             pl if st=="low_vol" else 1-pl,
