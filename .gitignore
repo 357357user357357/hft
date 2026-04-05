@@ -12,3 +12,4 @@ data/*.zip
 data/*.csv
 .vscode/
 .claude/
+.env
