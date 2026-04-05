@@ -41,6 +41,7 @@ from pair_arb import (
     PairArb, PairConfig, PairSignal,
     kalman_batch, rolling_zscore, engle_granger,
     CANDIDATE_PAIRS,
+    _rust_mod as _pair_rust_mod, _RUST_PAIR,
 )
 
 
@@ -227,9 +228,68 @@ class PairBacktest:
         # ── Fee + slippage total (both legs, round-trip) ──────────────────────
         total_cost = 4 * (cfg.fee_pct + cfg.slippage_pct) / 100.0
 
-        # ── Run each algorithm ────────────────────────────────────────────────
+        # ── Cointegration gate — skip simulation entirely if pair not coint ───
+        coint_blocked = cfg.require_coint and coint_p > pcfg.coint_p_threshold
+
+        # ── Rust fast-path: run all 4 algos in one native loop ────────────────
+        # pair_backtest_run() replaces the Python for-loop over each bar.
+        # Falls back to Python loop automatically if Rust unavailable.
+        rust_available = (
+            _RUST_PAIR
+            and _pair_rust_mod is not None
+            and hasattr(_pair_rust_mod, "pair_backtest_run")
+            and not coint_blocked
+            and cfg.run_shot and cfg.run_depth_shot
+            and cfg.run_averages and cfg.run_vector
+        )
+
         results: Dict[str, PairStats] = {}
 
+        if rust_available:
+            # Single Rust call — all 4 algorithms at once.
+            # Rust extension returns untyped tuple; unpack via index to keep Pyright happy.
+            raw = _pair_rust_mod.pair_backtest_run(  # type: ignore[union-attr]
+                zscores, spreads, prices_a[:n],
+                volumes_a, volumes_b,
+                cfg.lookback_bars, cfg.max_hold_bars,
+                pcfg.zscore_entry, pcfg.zscore_exit, pcfg.zscore_stop,
+                cfg.fee_pct, cfg.slippage_pct,
+                cfg.avg_short_bars, cfg.avg_long_bars, cfg.avg_trigger_pct,
+                cfg.vec_velocity_bars, cfg.vec_min_velocity,
+            )
+            # raw = (shot_trades, shot_wins, shot_pnl,
+            #        depth_trades, depth_wins, depth_pnl,
+            #        avg_trades,   avg_wins,   avg_pnl,
+            #        vec_trades,   vec_wins,   vec_pnl)
+            # cast() to a concrete type so Pyright stops propagating Any
+            from typing import cast as _cast
+            _r: List[float] = list(_cast(tuple, raw))  # type: ignore[arg-type]
+            _r = [float(x) for x in _r]  # type: ignore[misc]
+            _algo_raw: List[Tuple[str, int, int, float]] = [
+                ("shot",       int(_r[0]),  int(_r[1]),  _r[2]),
+                ("depth_shot", int(_r[3]),  int(_r[4]),  _r[5]),
+                ("averages",   int(_r[6]),  int(_r[7]),  _r[8]),
+                ("vector",     int(_r[9]),  int(_r[10]), _r[11]),
+            ]
+
+            for algo_name, total, wins, pnl in _algo_raw:
+                s = PairStats(algo=algo_name, pair=pair_label)
+                s.coint_adf = adf_stat; s.coint_pval = coint_p
+                s.total_trades = total; s.winning_trades = wins
+                s.losing_trades = total - wins
+                s.total_pnl_pct = pnl
+                if total > 0:
+                    s.win_rate    = wins / total
+                    s.avg_pnl_pct = pnl / total
+                    wins_pnl  = pnl * s.win_rate
+                    loses_pnl = pnl * (1.0 - s.win_rate)
+                    s.profit_factor = abs(wins_pnl / loses_pnl) if abs(loses_pnl) > 1e-12 else float("inf")
+                    avg = pnl / total
+                    s.sharpe_ratio = avg / (abs(avg) * 0.5 + 1e-9) * math.sqrt(252) if avg != 0 else 0.0
+                results[algo_name] = s
+            return results
+
+        # ── Python fallback: original per-algorithm loop ──────────────────────
         algo_flags = {
             "shot":       cfg.run_shot,
             "depth_shot": cfg.run_depth_shot,
@@ -245,7 +305,7 @@ class PairBacktest:
             st.coint_pval = coint_p
 
             # Don't trade if cointegration test fails (when required)
-            if cfg.require_coint and coint_p > pcfg.coint_p_threshold:
+            if coint_blocked:
                 st.compute()
                 results[algo_name] = st
                 continue

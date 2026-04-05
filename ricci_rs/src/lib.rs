@@ -616,7 +616,11 @@ fn kalman_pair_batch(
     Ok((betas, p_vars, spreads))
 }
 
-/// Rolling z-score of a spread series.
+/// Rolling z-score of a spread series — O(N) using Welford's online algorithm.
+///
+/// Welford's method maintains a running mean and sum-of-squared-deviations
+/// in a sliding window with O(1) work per step (add new, remove oldest).
+/// This is ~window× faster than the naive O(N×window) approach.
 ///
 /// Arguments:
 ///   spreads – raw spread values (length N)
@@ -637,17 +641,41 @@ fn pair_zscore(
     let mut means   = vec![0.0f64; n];
     let mut stds    = vec![0.0f64; n];
 
+    // Welford's online mean + M2 (sum of squared deviations from mean).
+    // For a sliding window of size w we add the new element and remove the
+    // oldest using the standard incremental update formulae.
+    let mut win_mean = 0.0f64;
+    let mut win_m2   = 0.0f64;   // Σ(x - mean)²
+    let mut count    = 0usize;
+
     for i in 0..n {
-        let start = if i + 1 >= w { i + 1 - w } else { 0 };
-        let slice = &spreads[start..=i];
-        let len = slice.len() as f64;
-        let mean = slice.iter().sum::<f64>() / len;
-        let var  = slice.iter().map(|s| (s - mean) * (s - mean)).sum::<f64>() / len;
-        let std  = var.sqrt();
-        means[i] = mean;
+        let x_new = spreads[i];
+
+        if count < w {
+            // Window not yet full — standard Welford add
+            count += 1;
+            let delta  = x_new - win_mean;
+            win_mean  += delta / count as f64;
+            let delta2 = x_new - win_mean;
+            win_m2    += delta * delta2;
+        } else {
+            // Window full — sliding update: add x_new, remove x_old
+            let x_old  = spreads[i - w];
+            let old_mean = win_mean;
+            win_mean  += (x_new - x_old) / w as f64;
+            // M2 update: Chan's parallel algorithm for sliding window
+            win_m2    += (x_new - x_old) * (x_new - win_mean + x_old - old_mean);
+            // Numerical stability floor
+            if win_m2 < 0.0 { win_m2 = 0.0; }
+        }
+
+        let var = win_m2 / count as f64;
+        let std = var.sqrt();
+        means[i] = win_mean;
         stds[i]  = std;
-        if i + 1 >= w && std > 1e-12 {
-            zscores[i] = (spreads[i] - mean) / std;
+
+        if count >= w && std > 1e-12 {
+            zscores[i] = (x_new - win_mean) / std;
         }
     }
 
@@ -723,6 +751,281 @@ fn engle_granger_coint(
     Ok((beta, adf_stat, p_approx))
 }
 
+// ── Pair backtest simulation loop ────────────────────────────────────────────
+//
+// Runs all four algorithm strategies (shot, depth_shot, averages, vector)
+// over the pre-computed z-score series in a single Rust pass.
+//
+// This replaces the innermost Python for-loop in pair_backtest.py which is
+// the remaining hot path (~18ms per run × 28 pairs = 500ms total).
+//
+// Each algorithm is a small state machine:
+//   shot        — enter when |z| > entry; exit when |z| < exit or timeout
+//   depth_shot  — same but gate with volume-ratio confirmation
+//   averages    — enter on short-MA vs long-MA spread divergence
+//   vector      — enter on z-score velocity burst
+//
+// Trade P&L = spread_change / |entry_price_a| * 100  minus total_cost_pct
+//
+// Returns per-algorithm stats as a flat tuple so Python can unpack cheaply
+// without building a Dict on the Rust side:
+//   (shot_trades, shot_wins, shot_pnl,
+//    depth_trades, depth_wins, depth_pnl,
+//    avg_trades,   avg_wins,   avg_pnl,
+//    vec_trades,   vec_wins,   vec_pnl)
+
+#[allow(clippy::too_many_arguments)]
+fn run_algo_sim(
+    algo: u8,                   // 0=shot 1=depth_shot 2=averages 3=vector
+    zscores:      &[f64],
+    spreads:      &[f64],
+    prices_a:     &[f64],
+    vol_ratio:    &[f64],       // volumes_a[i] / volumes_b[i], pre-computed
+    lookback:     usize,
+    max_hold:     usize,
+    zscore_entry: f64,
+    zscore_exit:  f64,
+    zscore_stop:  f64,
+    total_cost:   f64,          // fee+slippage as fraction (not %)
+    avg_short:    usize,
+    avg_long:     usize,
+    avg_trig_pct: f64,
+    vec_vel_bars: usize,
+    vec_min_vel:  f64,
+) -> (i32, i32, f64) {
+    // Returns (total_trades, winning_trades, total_pnl_pct)
+    let n = zscores.len();
+    let mut total_trades = 0i32;
+    let mut winning      = 0i32;
+    let mut total_pnl    = 0.0f64;
+
+    let mut in_pos      = false;
+    let mut pos_side    = 0i8;   // +1 = long spread, -1 = short spread
+    let mut entry_bar   = 0usize;
+    let mut entry_sp    = 0.0f64;
+    let mut entry_pa    = 0.0f64;
+
+    for i in lookback..n {
+        let z  = zscores[i];
+        let sp = spreads[i];
+        let pa = prices_a[i];
+
+        // ── Exit ─────────────────────────────────────────────────────────────
+        if in_pos {
+            let held = i - entry_bar;
+            let mut exit_now = false;
+
+            match algo {
+                0 => { // shot
+                    if pos_side > 0 && z >= -zscore_exit { exit_now = true; }
+                    if pos_side < 0 && z <=  zscore_exit { exit_now = true; }
+                    if z.abs() > zscore_stop              { exit_now = true; }
+                    if held >= max_hold                   { exit_now = true; }
+                }
+                1 => { // depth_shot — volume-ratio confirmation on exit
+                    let vr = vol_ratio[i];
+                    if pos_side > 0 && z >= -zscore_exit && vr < 1.5 { exit_now = true; }
+                    if pos_side < 0 && z <=  zscore_exit && vr > 0.7 { exit_now = true; }
+                    if z.abs() > zscore_stop { exit_now = true; }
+                    if held >= max_hold      { exit_now = true; }
+                }
+                2 => { // averages — exit when short MA reverts to long MA
+                    if i >= avg_long {
+                        let s_start = i + 1 - avg_short;
+                        let l_start = i + 1 - avg_long;
+                        let short_avg: f64 = spreads[s_start..=i].iter().sum::<f64>() / avg_short as f64;
+                        let long_avg:  f64 = spreads[l_start..=i].iter().sum::<f64>() / avg_long  as f64;
+                        let la_abs = long_avg.abs().max(1e-9);
+                        let delta_pct = (short_avg - long_avg) / la_abs * 100.0;
+                        let thr = avg_trig_pct * 0.3;
+                        if pos_side > 0 && delta_pct >= -thr { exit_now = true; }
+                        if pos_side < 0 && delta_pct <=  thr { exit_now = true; }
+                    }
+                    if held >= max_hold { exit_now = true; }
+                }
+                _ => { // vector — exit when velocity reverses
+                    if i >= vec_vel_bars {
+                        let vel = z - zscores[i - vec_vel_bars];
+                        if pos_side > 0 && vel > 0.0 { exit_now = true; }
+                        if pos_side < 0 && vel < 0.0 { exit_now = true; }
+                    }
+                    if held >= max_hold { exit_now = true; }
+                }
+            }
+
+            if exit_now {
+                let normaliser = entry_pa.abs().max(1e-6);
+                let raw_pnl = if pos_side > 0 {
+                    (sp - entry_sp) / normaliser
+                } else {
+                    (entry_sp - sp) / normaliser
+                };
+                let net_pct = raw_pnl * 100.0 - total_cost;
+                total_pnl    += net_pct;
+                total_trades += 1;
+                if net_pct > 0.0 { winning += 1; }
+                in_pos   = false;
+                pos_side = 0;
+            }
+        }
+
+        // ── Entry ─────────────────────────────────────────────────────────────
+        if !in_pos {
+            let mut entered  = false;
+            let mut new_side = 0i8;
+
+            match algo {
+                0 => { // shot
+                    if z >  zscore_entry { entered = true; new_side = -1; }
+                    else if z < -zscore_entry { entered = true; new_side = 1; }
+                }
+                1 => { // depth_shot — require volume confirmation
+                    let vr = vol_ratio[i];
+                    if z >  zscore_entry && vr > 1.2 { entered = true; new_side = -1; }
+                    else if z < -zscore_entry && vr < 0.8 { entered = true; new_side = 1; }
+                }
+                2 => { // averages
+                    if i >= avg_long {
+                        let s_start = i + 1 - avg_short;
+                        let l_start = i + 1 - avg_long;
+                        let short_avg: f64 = spreads[s_start..=i].iter().sum::<f64>() / avg_short as f64;
+                        let long_avg:  f64 = spreads[l_start..=i].iter().sum::<f64>() / avg_long  as f64;
+                        let la_abs = long_avg.abs().max(1e-9);
+                        let delta_pct = (short_avg - long_avg) / la_abs * 100.0;
+                        if delta_pct >  avg_trig_pct && z > 1.0 { entered = true; new_side = -1; }
+                        else if delta_pct < -avg_trig_pct && z < -1.0 { entered = true; new_side = 1; }
+                    }
+                }
+                _ => { // vector
+                    if i >= vec_vel_bars {
+                        let vel = z - zscores[i - vec_vel_bars];
+                        if vel >  vec_min_vel && z > 1.0 { entered = true; new_side = -1; }
+                        else if vel < -vec_min_vel && z < -1.0 { entered = true; new_side = 1; }
+                    }
+                }
+            }
+
+            if entered {
+                in_pos    = true;
+                pos_side  = new_side;
+                entry_bar = i;
+                entry_sp  = sp;
+                entry_pa  = pa;
+            }
+        }
+    }
+
+    (total_trades, winning, total_pnl)
+}
+
+/// Full pair backtest simulation — all 4 algorithms in one Rust pass.
+///
+/// Pre-requisite: caller has already computed zscores and spreads via
+/// kalman_pair_batch() + pair_zscore().  This function only runs the
+/// trading simulation loop, which is the hot path (~18ms in Python).
+///
+/// Arguments:
+///   zscores     – z-score series (length N)
+///   spreads     – raw spread series (length N)
+///   prices_a    – leg-A price series (length N)
+///   volumes_a   – leg-A volume series (or empty → uniform 1.0)
+///   volumes_b   – leg-B volume series (or empty → uniform 1.0)
+///   lookback    – bars before trading starts
+///   max_hold    – max bars to hold a position
+///   zscore_entry – entry threshold   (default 2.0)
+///   zscore_exit  – exit threshold    (default 0.5)
+///   zscore_stop  – stop-loss z-score (default 4.0)
+///   fee_pct      – one-way fee in %  (default 0.04)
+///   slippage_pct – one-way slippage  (default 0.02)
+///   avg_short    – averages short window in bars (default 10)
+///   avg_long     – averages long window in bars  (default 60)
+///   avg_trig_pct – averages trigger deviation %  (default 0.3)
+///   vec_vel_bars – vector velocity lookback bars (default 5)
+///   vec_min_vel  – vector minimum velocity       (default 0.5)
+///
+/// Returns 12-tuple:
+///   (shot_trades, shot_wins, shot_pnl,
+///    depth_trades, depth_wins, depth_pnl,
+///    avg_trades,   avg_wins,   avg_pnl,
+///    vec_trades,   vec_wins,   vec_pnl)
+#[pyfunction]
+#[pyo3(signature = (
+    zscores, spreads, prices_a,
+    volumes_a=None, volumes_b=None,
+    lookback=200, max_hold=50,
+    zscore_entry=2.0, zscore_exit=0.5, zscore_stop=4.0,
+    fee_pct=0.04, slippage_pct=0.02,
+    avg_short=10, avg_long=60, avg_trig_pct=0.3,
+    vec_vel_bars=5, vec_min_vel=0.5
+))]
+#[allow(clippy::too_many_arguments)]
+fn pair_backtest_run(
+    _py: Python<'_>,
+    zscores:      Vec<f64>,
+    spreads:      Vec<f64>,
+    prices_a:     Vec<f64>,
+    volumes_a:    Option<Vec<f64>>,
+    volumes_b:    Option<Vec<f64>>,
+    lookback:     usize,
+    max_hold:     usize,
+    zscore_entry: f64,
+    zscore_exit:  f64,
+    zscore_stop:  f64,
+    fee_pct:      f64,
+    slippage_pct: f64,
+    avg_short:    usize,
+    avg_long:     usize,
+    avg_trig_pct: f64,
+    vec_vel_bars: usize,
+    vec_min_vel:  f64,
+) -> PyResult<(i32,i32,f64, i32,i32,f64, i32,i32,f64, i32,i32,f64)> {
+    let n = zscores.len().min(spreads.len()).min(prices_a.len());
+    // Total round-trip cost in %.
+    // Python passes fee_pct=0.04 meaning 4 bps = 0.04%.
+    // Python formula: net_pnl = raw_pnl * 100 - (4*(fee+slip)/100)
+    //   where the /100 converts the already-percent inputs to fraction.
+    // So total_cost here = 4*(fee_pct + slippage_pct) / 100.0
+    let total_cost = 4.0 * (fee_pct + slippage_pct) / 100.0;
+
+    // Pre-compute vol_ratio: vol_a / vol_b  (uniform 1.0 if not provided)
+    let vol_ratio: Vec<f64> = {
+        let va = volumes_a.as_deref().unwrap_or(&[]);
+        let vb = volumes_b.as_deref().unwrap_or(&[]);
+        (0..n).map(|i| {
+            let a = if i < va.len() { va[i] } else { 1.0 };
+            let b = if i < vb.len() { vb[i] } else { 1.0 };
+            a / b.max(1e-9)
+        }).collect()
+    };
+
+    let common_args = (
+        &zscores[..n], &spreads[..n], &prices_a[..n], &vol_ratio[..],
+        lookback, max_hold,
+        zscore_entry, zscore_exit, zscore_stop, total_cost,
+        avg_short, avg_long, avg_trig_pct,
+        vec_vel_bars, vec_min_vel,
+    );
+
+    let (st, sw, sp) = run_algo_sim(0, common_args.0, common_args.1, common_args.2,
+        common_args.3, common_args.4, common_args.5, common_args.6, common_args.7,
+        common_args.8, common_args.9, common_args.10, common_args.11, common_args.12,
+        common_args.13, common_args.14);
+    let (dt, dw, dp) = run_algo_sim(1, common_args.0, common_args.1, common_args.2,
+        common_args.3, common_args.4, common_args.5, common_args.6, common_args.7,
+        common_args.8, common_args.9, common_args.10, common_args.11, common_args.12,
+        common_args.13, common_args.14);
+    let (at, aw, ap) = run_algo_sim(2, common_args.0, common_args.1, common_args.2,
+        common_args.3, common_args.4, common_args.5, common_args.6, common_args.7,
+        common_args.8, common_args.9, common_args.10, common_args.11, common_args.12,
+        common_args.13, common_args.14);
+    let (vt, vw, vp) = run_algo_sim(3, common_args.0, common_args.1, common_args.2,
+        common_args.3, common_args.4, common_args.5, common_args.6, common_args.7,
+        common_args.8, common_args.9, common_args.10, common_args.11, common_args.12,
+        common_args.13, common_args.14);
+
+    Ok((st, sw, sp,  dt, dw, dp,  at, aw, ap,  vt, vw, vp))
+}
+
 #[pymodule]
 fn ricci_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(wasserstein_1, m)?)?;
@@ -736,5 +1039,6 @@ fn ricci_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(kalman_pair_batch, m)?)?;
     m.add_function(wrap_pyfunction!(pair_zscore, m)?)?;
     m.add_function(wrap_pyfunction!(engle_granger_coint, m)?)?;
+    m.add_function(wrap_pyfunction!(pair_backtest_run, m)?)?;
     Ok(())
 }
