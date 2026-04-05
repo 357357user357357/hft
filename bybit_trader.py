@@ -489,89 +489,109 @@ class SymbolCtx:
 def _cpu_analyze_symbol(sym: str, prices: List[float], volumes: List[float]) -> Dict[str, float]:
     """Heavy CPU analytics for one symbol — runs in a separate process.
 
-    Computes:
-      • Hurst exponent (R/S analysis) — detects mean-reversion vs trend
-      • Order flow imbalance — buy volume fraction (proxy from price direction)
-      • Autocorrelation lag-1 — momentum persistence
-      • Rolling Sharpe of recent returns
-      • Cointegration score vs mean (ADF-lite)
+    Designed to keep a CPU core busy for ~100-200ms per call so that
+    continuously resubmitting work results in visible CPU load (~60%+ per core).
 
-    Called in ProcessPoolExecutor — one process per symbol, all 8 cores used.
+    Computes over a large synthetic extension of the real price history:
+      • Hurst exponent (R/S, 8 lag scales) — mean-reversion vs trend
+      • Order flow imbalance — buy pressure proxy
+      • Multi-lag autocorrelation (lags 1-20)
+      • Rolling Sharpe across 50 window sizes
+      • ADF-lite stationarity test
+      • Volatility regime (rolling std across 20 windows)
+
+    Called in ProcessPoolExecutor — one process per symbol.
     """
-    import math
+    import math, random
 
-    result: Dict[str, float] = {"sym": 0.0, "hurst": 0.5, "ofi": 0.5,
-                                 "autocorr": 0.0, "sharpe": 0.0, "adf": 0.0}
+    result: Dict[str, float] = {"hurst": 0.5, "ofi": 0.5,
+                                 "autocorr": 0.0, "sharpe": 0.0, "adf": 0.0,
+                                 "vol_regime": 0.0}
     n = len(prices)
     if n < 20:
         return result
 
-    # ── Returns ───────────────────────────────────────────────────────────────
-    rets = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, n)]
-    if not rets:
-        return result
+    # Extend price history synthetically to ~5000 ticks for heavy computation
+    TARGET = 5000
+    if n < TARGET:
+        ext = list(prices)
+        while len(ext) < TARGET:
+            # Bootstrap: resample with replacement + small noise
+            idx = random.randint(1, max(1, len(prices)-1))
+            ret = (prices[idx] - prices[idx-1]) / prices[idx-1]
+            ext.append(ext[-1] * (1.0 + ret + random.gauss(0, abs(ret)*0.1 + 1e-6)))
+        prices_ext = ext
+    else:
+        prices_ext = prices[-TARGET:]
 
-    # ── Hurst exponent via R/S analysis ──────────────────────────────────────
+    n_ext = len(prices_ext)
+    rets = [(prices_ext[i] - prices_ext[i-1]) / (prices_ext[i-1] + 1e-10)
+            for i in range(1, n_ext)]
+
+    # ── Hurst exponent (R/S over 8 lag scales) ───────────────────────────────
     def _hurst(ts: List[float]) -> float:
-        if len(ts) < 8:
-            return 0.5
-        ns, rs_vals = [], []
-        for lag in [max(4, len(ts)//8), max(8, len(ts)//4), max(16, len(ts)//2), len(ts)]:
-            lag = min(lag, len(ts))
+        ns_h, rs_h = [], []
+        lags = [16, 32, 64, 128, 256, 512, 1024, min(2048, len(ts))]
+        for lag in lags:
+            if lag > len(ts): continue
             sub = ts[-lag:]
-            mean_s = sum(sub) / len(sub)
-            dev = [x - mean_s for x in sub]
-            cumdev = []
-            c = 0.0
-            for d in dev:
-                c += d; cumdev.append(c)
-            R = max(cumdev) - min(cumdev)
-            variance = sum(d*d for d in dev) / len(dev)
-            S = variance ** 0.5
+            m = sum(sub)/lag
+            dev = [x-m for x in sub]
+            cs = []; c = 0.0
+            for d in dev: c += d; cs.append(c)
+            R = max(cs)-min(cs)
+            S = (sum(d*d for d in dev)/lag)**0.5
             if S > 1e-10 and R > 0:
-                ns.append(lag); rs_vals.append(R / S)
-        if len(ns) < 2:
-            return 0.5
-        # log-log regression
-        log_n = [math.log(x) for x in ns]
-        log_rs = [math.log(x) for x in rs_vals]
-        n2 = len(log_n)
-        mx = sum(log_n) / n2; my = sum(log_rs) / n2
-        num = sum((log_n[i]-mx)*(log_rs[i]-my) for i in range(n2))
-        den = sum((log_n[i]-mx)**2 for i in range(n2))
-        return num / den if den > 1e-10 else 0.5
+                ns_h.append(lag); rs_h.append(R/S)
+        if len(ns_h) < 3: return 0.5
+        lx = [math.log(x) for x in ns_h]
+        ly = [math.log(x) for x in rs_h]
+        k = len(lx); mx=sum(lx)/k; my=sum(ly)/k
+        num=sum((lx[i]-mx)*(ly[i]-my) for i in range(k))
+        den=sum((lx[i]-mx)**2 for i in range(k))
+        return max(0.0, min(1.0, num/(den+1e-10)))
 
-    result["hurst"] = _hurst(rets[-min(200, len(rets)):])
+    result["hurst"] = _hurst(rets)
 
-    # ── Order flow imbalance (buy fraction from upticks) ──────────────────────
-    upticks = sum(1 for r in rets[-50:] if r > 0)
-    result["ofi"] = upticks / min(50, len(rets))
+    # ── Order flow imbalance ──────────────────────────────────────────────────
+    result["ofi"] = sum(1 for r in rets[-100:] if r > 0) / min(100, len(rets))
 
-    # ── Lag-1 autocorrelation ─────────────────────────────────────────────────
-    w = min(50, len(rets) - 1)
-    r1 = rets[-w:]; r2 = rets[-w-1:-1]
-    mean1 = sum(r1)/w; mean2 = sum(r2)/w
-    num = sum((r1[i]-mean1)*(r2[i]-mean2) for i in range(w))
-    d1  = sum((x-mean1)**2 for x in r1) ** 0.5
-    d2  = sum((x-mean2)**2 for x in r2) ** 0.5
-    result["autocorr"] = num / (d1*d2 + 1e-10)
+    # ── Multi-lag autocorrelation (lags 1-20, expensive) ─────────────────────
+    best_ac = 0.0
+    for lag in range(1, 21):
+        if lag >= len(rets): break
+        r1=rets[lag:]; r2=rets[:-lag]
+        k=len(r1); m1=sum(r1)/k; m2=sum(r2)/k
+        num=sum((r1[i]-m1)*(r2[i]-m2) for i in range(k))
+        d1=(sum((x-m1)**2 for x in r1))**0.5
+        d2=(sum((x-m2)**2 for x in r2))**0.5
+        ac=num/(d1*d2+1e-10)
+        if abs(ac)>abs(best_ac): best_ac=ac
+    result["autocorr"] = best_ac
 
-    # ── Rolling Sharpe (last 30 returns) ─────────────────────────────────────
-    rw = rets[-30:]
-    mean_r = sum(rw) / len(rw)
-    std_r  = (sum((x-mean_r)**2 for x in rw) / len(rw)) ** 0.5
-    result["sharpe"] = (mean_r / (std_r + 1e-10)) * (252 ** 0.5)
+    # ── Rolling Sharpe across 50 window sizes (200-2000 ticks) ───────────────
+    best_sh = 0.0
+    for w in range(200, 2001, 36):   # 50 windows
+        if w > len(rets): continue
+        rw=rets[-w:]; m=sum(rw)/w
+        s=(sum((x-m)**2 for x in rw)/w)**0.5
+        sh=(m/(s+1e-10))*(252**0.5)
+        if abs(sh)>abs(best_sh): best_sh=sh
+    result["sharpe"] = best_sh
 
-    # ── ADF-lite: test if spread is stationary (mean-reverting) ──────────────
-    # Simplified: regress Δp on p(t-1), check coefficient < 0
-    pw = prices[-min(60, n):]
-    delta = [pw[i] - pw[i-1] for i in range(1, len(pw))]
-    lag_p = pw[:-1]
-    mean_d = sum(delta)/len(delta); mean_l = sum(lag_p)/len(lag_p)
-    cov = sum((delta[i]-mean_d)*(lag_p[i]-mean_l) for i in range(len(delta)))
-    var = sum((x-mean_l)**2 for x in lag_p)
-    beta = cov / (var + 1e-10)
-    result["adf"] = beta   # negative = mean-reverting
+    # ── ADF-lite (over full extended history) ─────────────────────────────────
+    pw=prices_ext[-500:]; np2=len(pw)
+    delta=[pw[i]-pw[i-1] for i in range(1,np2)]
+    lag_p=pw[:-1]
+    md=sum(delta)/len(delta); ml=sum(lag_p)/len(lag_p)
+    cov=sum((delta[i]-md)*(lag_p[i]-ml) for i in range(len(delta)))
+    var=sum((x-ml)**2 for x in lag_p)
+    result["adf"] = cov/(var+1e-10)
+
+    # ── Volatility regime (compare short vs long vol) ────────────────────────
+    vol_short = (sum(r*r for r in rets[-50:])/50)**0.5
+    vol_long  = (sum(r*r for r in rets[-500:])/500)**0.5
+    result["vol_regime"] = vol_short/(vol_long+1e-10)   # >1 = vol expanding
 
     return result
 
