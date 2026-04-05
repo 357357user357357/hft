@@ -92,7 +92,7 @@ class BybitClient:
             "https://api-testnet.bybit.com" if testnet
             else "https://api.bybit.com"
         )
-        self.recv_window = "5000"
+        self.recv_window = "10000"
 
     def _sign(self, timestamp: str, params_str: str) -> str:
         """HMAC-SHA256 signature: timestamp + api_key + recv_window + params."""
@@ -295,10 +295,14 @@ def _render(states: List["LiveState"], live_mode: bool, client: Optional[BybitCl
     win_rate = winning / total_trades * 100 if total_trades > 0 else 0.0
     print(f"{_BOLD}{'─'*70}{_RESET}")
     if gpu:
+        _proc = getattr(gpu, "_gpu_proc", None)
+        _poll = _proc.poll() if _proc else "none"
+        err_str = f"  ERR:{gpu._last_gpu_error[:40]}" if gpu._last_gpu_error else ""
+        proc_str = f"  proc={'up' if _proc and _poll is None else f'dead({_poll})'}"
         gpu_str = (f"  {_DIM}[{gpu.backend}  util={gpu.gpu_util_pct:.0f}%"
                    f"  VRAM={gpu.vram_mb}MB"
                    f"  MA{gpu.best_fast_w}/{gpu.best_slow_w}"
-                   f"  thr={gpu.best_gap_threshold*100:.4f}%]{_RESET}")
+                   f"  thr={gpu.best_gap_threshold*100:.4f}%{proc_str}{err_str}]{_RESET}")
     else:
         gpu_str = ""
     print(f"{_BOLD}  BYBIT MULTI-TRADER  {_RESET}{mode_str}  "
@@ -511,8 +515,8 @@ def _cpu_analyze_symbol(sym: str, prices: List[float], volumes: List[float]) -> 
     if n < 20:
         return result
 
-    # Extend price history synthetically to ~5000 ticks for heavy computation
-    TARGET = 5000
+    # Extend price history synthetically to ~10000 ticks for heavy computation
+    TARGET = 10_000
     if n < TARGET:
         ext = list(prices)
         while len(ext) < TARGET:
@@ -528,10 +532,10 @@ def _cpu_analyze_symbol(sym: str, prices: List[float], volumes: List[float]) -> 
     rets = [(prices_ext[i] - prices_ext[i-1]) / (prices_ext[i-1] + 1e-10)
             for i in range(1, n_ext)]
 
-    # ── Hurst exponent (R/S over 8 lag scales) ───────────────────────────────
+    # ── Hurst exponent (R/S over 12 lag scales) ──────────────────────────────
     def _hurst(ts: List[float]) -> float:
         ns_h, rs_h = [], []
-        lags = [16, 32, 64, 128, 256, 512, 1024, min(2048, len(ts))]
+        lags = [16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, min(2048, len(ts))]
         for lag in lags:
             if lag > len(ts): continue
             sub = ts[-lag:]
@@ -556,11 +560,13 @@ def _cpu_analyze_symbol(sym: str, prices: List[float], volumes: List[float]) -> 
     # ── Order flow imbalance ──────────────────────────────────────────────────
     result["ofi"] = sum(1 for r in rets[-100:] if r > 0) / min(100, len(rets))
 
-    # ── Multi-lag autocorrelation (lags 1-20, expensive) ─────────────────────
+    # ── Multi-lag autocorrelation (lags 1-50, over full 20k history) ────────────
     best_ac = 0.0
-    for lag in range(1, 21):
-        if lag >= len(rets): break
-        r1=rets[lag:]; r2=rets[:-lag]
+    # Use last 3000 points for autocorr — O(n) per lag, 30 lags
+    ac_rets = rets[-5000:]
+    for lag in range(1, 51):
+        if lag >= len(ac_rets): break
+        r1=ac_rets[lag:]; r2=ac_rets[:-lag]
         k=len(r1); m1=sum(r1)/k; m2=sum(r2)/k
         num=sum((r1[i]-m1)*(r2[i]-m2) for i in range(k))
         d1=(sum((x-m1)**2 for x in r1))**0.5
@@ -569,9 +575,9 @@ def _cpu_analyze_symbol(sym: str, prices: List[float], volumes: List[float]) -> 
         if abs(ac)>abs(best_ac): best_ac=ac
     result["autocorr"] = best_ac
 
-    # ── Rolling Sharpe across 50 window sizes (200-2000 ticks) ───────────────
+    # ── Rolling Sharpe across 100 window sizes (200-5000 ticks) ──────────────
     best_sh = 0.0
-    for w in range(200, 2001, 36):   # 50 windows
+    for w in range(200, 4001, 36):   # 100 windows
         if w > len(rets): continue
         rw=rets[-w:]; m=sum(rw)/w
         s=(sum((x-m)**2 for x in rw)/w)**0.5
@@ -579,7 +585,7 @@ def _cpu_analyze_symbol(sym: str, prices: List[float], volumes: List[float]) -> 
         if abs(sh)>abs(best_sh): best_sh=sh
     result["sharpe"] = best_sh
 
-    # ── ADF-lite (over full extended history) ─────────────────────────────────
+    # ── ADF-lite (over 2000 points) ───────────────────────────────────────────
     pw=prices_ext[-500:]; np2=len(pw)
     delta=[pw[i]-pw[i-1] for i in range(1,np2)]
     lag_p=pw[:-1]
@@ -594,6 +600,130 @@ def _cpu_analyze_symbol(sym: str, prices: List[float], volumes: List[float]) -> 
     result["vol_regime"] = vol_short/(vol_long+1e-10)   # >1 = vol expanding
 
     return result
+
+
+# ── GPU optimizer subprocess script (stdin/stdout JSON IPC) ───────────────────
+# This script is launched as a separate process via subprocess.Popen.
+# It reads JSON lines from stdin (price buffers), runs GPU MA sweep,
+# and writes JSON lines to stdout (best params + utilization).
+# Own process = own GIL + own CUDA context — zero contention with asyncio.
+
+_GPU_WORKER_SCRIPT = r"""
+import sys, json, time
+
+try:
+    import torch
+    dev = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    # Pre-allocate 5800MB VRAM — 57% base + optimizer adds ~400MB → ~70% total
+    TARGET_MB = 5800
+    n_floats  = int(TARGET_MB * 1024**2 / 4)
+    _vram_buf = torch.zeros(n_floats, dtype=torch.float32, device=dev)
+    vram_base = int(torch.cuda.memory_allocated(dev) // 1024**2)
+    cuda_ok   = True
+except Exception as _e:
+    torch    = None
+    dev      = None
+    cuda_ok  = False
+    vram_base = 0
+
+T_TARGET = 60_000   # sized for ~70% GPU util
+BATCH     = 64
+
+def optimize(bufs):
+    syms = list(bufs.keys())
+    N    = len(syms)
+    if N == 0 or torch is None:
+        return None
+    t0 = time.monotonic()
+    rows = []
+    for sym in syms:
+        b   = bufs[sym]
+        arr = torch.tensor(b, dtype=torch.float32, device=dev)
+        reps = (T_TARGET // max(1, len(arr))) + 2
+        tiled = arr.repeat(reps)[:T_TARGET]
+        noise = torch.randn_like(tiled) * (tiled.std() * 0.001 + 1e-6)
+        rows.append(tiled + noise)
+    prices = torch.stack(rows)
+    T = prices.shape[1]
+    ret = torch.zeros_like(prices)
+    ret[:, 1:] = (prices[:, 1:] - prices[:, :-1]) / (prices[:, :-1].abs() + 1e-9)
+    cs = torch.zeros(N, T + 1, device=dev)
+    cs[:, 1:] = prices.cumsum(1)
+    def rm(w):
+        m = (cs[:, w:] - cs[:, :T - w + 1]) / w
+        pad = torch.full((N, w - 1), float("nan"), device=dev)
+        return torch.cat([pad, m], 1)
+    fg_r = torch.arange(2, 21, device=dev, dtype=torch.int32)
+    sg_r = torch.arange(8, 81, device=dev, dtype=torch.int32)
+    fg, sg = torch.meshgrid(fg_r, sg_r, indexing="ij")
+    fg = fg.reshape(-1); sg = sg.reshape(-1)
+    mask = fg < sg; fg = fg[mask]; sg = sg[mask]
+    C = fg.shape[0]
+    uw  = torch.unique(torch.cat([fg, sg])).tolist()
+    mc  = {int(w): rm(int(w)) for w in uw}
+    fgl = fg.tolist(); sgl = sg.tolist()
+    thr_list = torch.logspace(-5, -3, 20, device=dev)
+    best_s   = -999.0
+    best_fw  = 5; best_sw = 20; best_thr = 0.00003
+    ret_b    = ret.unsqueeze(0)
+    for bs in range(0, C, BATCH):
+        be  = min(bs + BATCH, C); B = be - bs
+        fma = torch.stack([mc[int(fgl[i])] for i in range(bs, be)])
+        sma = torch.stack([mc[int(sgl[i])] for i in range(bs, be)])
+        gm  = torch.nan_to_num((fma - sma) / (sma.abs() + 1e-9), nan=0.0)
+        for thr in thr_list.tolist():
+            sig = (gm > thr).float() - (gm < -thr).float()
+            pnl = sig[:, :, :-1] * ret_b[:, :, 1:]
+            pfl = pnl.reshape(B, -1)
+            sh  = (pfl.mean(1) / (pfl.std(1) + 1e-9)) * (252 ** 0.5)
+            idx = int(sh.argmax().item())
+            if sh[idx].item() > best_s:
+                best_s   = sh[idx].item()
+                best_fw  = int(fg[bs + idx].item())
+                best_sw  = int(sg[bs + idx].item())
+                best_thr = float(thr)
+        del fma, sma, gm
+    elapsed  = time.monotonic() - t0
+    util_pct = min(100.0, elapsed / 1.0 * 100)
+    vram_mb  = int(torch.cuda.memory_allocated(dev) // 1024**2)
+    return {"fast_w": best_fw, "slow_w": best_sw, "threshold": best_thr,
+            "util_pct": util_pct, "vram_mb": vram_mb}
+
+# Signal ready to parent
+sys.stdout.write(json.dumps({"ready": True, "cuda": cuda_ok, "vram_base_mb": vram_base}) + "\n")
+sys.stdout.flush()
+
+import select
+
+while True:
+    # Block until at least one line arrives
+    line = sys.stdin.readline()
+    if not line:
+        break
+    # Drain any queued-up lines — only keep the latest price snapshot
+    while True:
+        r, _, _ = select.select([sys.stdin], [], [], 0)
+        if r:
+            newer = sys.stdin.readline()
+            if newer:
+                line = newer  # discard older, keep newest
+            else:
+                break
+        else:
+            break
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        bufs = json.loads(line)
+        result = optimize(bufs)
+        if result:
+            sys.stdout.write(json.dumps(result) + "\n")
+            sys.stdout.flush()
+    except Exception as e:
+        sys.stdout.write(json.dumps({"error": str(e)}) + "\n")
+        sys.stdout.flush()
+"""
 
 
 # ── GPU analytics engine ──────────────────────────────────────────────────────
@@ -618,27 +748,15 @@ class GpuAnalytics:
     WIN_VOL  = 30    # volatility window
 
     def __init__(self) -> None:
-        self._bufs:    Dict[str, List[float]] = {}   # shared with WS loop
-        self.signals:  Dict[str, Dict[str, float]] = {}  # output
-        self._stop     = False
-        self._thread:  Optional[Any] = None
-
-        # Detect backend
-        try:
-            import torch
-            if torch.cuda.is_available():
-                self.device = torch.device("cuda")
-                name = torch.cuda.get_device_name(0)
-                mem  = torch.cuda.get_device_properties(0).total_memory // 1024**2
-                self.backend = f"GPU {name} {mem}MB"
-            else:
-                self.device  = torch.device("cpu")
-                self.backend = "CPU (torch)"
-            self._torch = torch
-        except ImportError:
-            self._torch  = None
-            self.device  = None
-            self.backend = "CPU (numpy)"
+        self._bufs:        Dict[str, List[float]] = {}   # shared with WS loop
+        self.signals:      Dict[str, Dict[str, float]] = {}  # output
+        self._stop         = False
+        self._thread:      Optional[Any] = None
+        self._latest_bufs: Optional[Dict[str, List[float]]] = None  # feeder→writer
+        # Parent process stays CPU-only — GPU is owned exclusively by the subprocess.
+        self._torch  = None
+        self.device  = None
+        self.backend = "GPU subprocess (CMP 50HX)"
 
     def update_buf(self, sym: str, price: float) -> None:
         """Called from WS loop on every tick."""
@@ -712,186 +830,155 @@ class GpuAnalytics:
     best_slow_w:        int   = 20
     gpu_util_pct:       float = 0.0       # reported to dashboard
     vram_mb:            int   = 0         # VRAM used MB
+    _last_gpu_error:    str   = ""        # last optimizer error (for debug)
 
     def _run(self) -> None:
-        """Background thread — runs continuously.
-
-        Two interleaved tasks:
-        1. Signal computation  (every INTERVAL=1s)  — fast, feeds trading loop
-        2. Parameter optimizer (continuous, fills remaining GPU budget)
-           Sweeps 512 fast/slow MA combinations on current price history,
-           scores each by Sharpe of simulated trades, updates best_* params.
+        """Feeder thread — snapshot prices every 0.5s, compute fast CPU signals,
+        and drop the latest snapshot into _latest_bufs for the writer thread.
+        Never touches the pipe directly — no blocking IO in this thread.
         """
         import time as _time
-        torch = self._torch
-        iter_count = 0
 
         while not self._stop:
             t0 = _time.monotonic()
+            # Include any symbol with at least 2 ticks — GPU worker handles short bufs fine
+            bufs = {s: list(b) for s, b in self._bufs.items() if len(b) >= 2}
 
-            bufs = {s: list(b) for s, b in self._bufs.items() if len(b) >= self.WIN_FAST + 2}
-
-            # ── Task 1: signal computation ────────────────────────────────────
+            # ── Fast CPU signal computation ───────────────────────────────────
             if bufs:
                 try:
-                    if torch and self.device is not None:
-                        result = self._compute_gpu_batch(bufs)
-                    else:
-                        result = {s: self._compute_cpu(s, b) for s, b in bufs.items()}
+                    result = {s: self._compute_cpu(s, b) for s, b in bufs.items()}
                     self.signals.update(result)
                 except Exception:
                     pass
 
-            # ── Task 2: parameter optimizer (GPU only) ────────────────────────
-            if torch and self.device is not None and bufs:
-                try:
-                    self._optimize_params(bufs, torch)
-                except Exception:
-                    pass
+            # ── Drop latest snapshot for writer thread ────────────────────────
+            if bufs:
+                self._latest_bufs = bufs   # atomic reference replace — writer picks it up
 
             elapsed = _time.monotonic() - t0
-            self.gpu_util_pct = min(100.0, elapsed / self.INTERVAL * 100)
-            iter_count += 1
-            # No sleep — optimizer runs continuously to maximize GPU use
-            # Signal read is non-blocking so trading loop never waits for us
+            # If we have data, pace at INTERVAL. If not, poll fast so first tick gets through.
+            wait = max(0.05, self.INTERVAL - elapsed) if bufs else 0.1
+            _time.sleep(wait)
 
-    # Persistent VRAM buffer — allocated once, keeps GPU memory at ~60%
-    # 5800MB / 4 bytes per float = 1.45B floats → tensor of shape (1450, 1_000_000)
-    _vram_buffer: Optional[Any] = None
-    _TARGET_VRAM_MB = 5800
-
-    def _optimize_params(self, bufs: Dict[str, List[float]], torch: Any) -> None:
-        """GPU parameter sweep — scales to fill 30% GPU util + 6GB VRAM.
-
-        Strategy:
-        - Synthetic extension: tile real price history to T=50000 ticks per coin
-        - All 7 coins stacked → (7, 50000) price matrix on GPU
-        - 706 MA combos × 20 thresholds swept in parallel tensor ops
-        - Full pass uses ~5-6GB VRAM, keeps GPU busy 200-400ms per cycle
-
-        Updates best MA windows and gap threshold every cycle.
+    def _stdin_writer(self) -> None:
+        """Dedicated writer thread — picks up the latest price snapshot and
+        writes it to the GPU subprocess stdin.  Runs independently of asyncio
+        and CPU workers so a blocked pipe never stalls signal computation.
+        Uses os.write on the raw fd to avoid buffered-IO deadlock.
         """
-        dev   = self.device
-        torch = self._torch
-
-        # Build extended price matrix: tile real data to fill GPU
-        T_TARGET = 40_000  # ticks — sized to use ~5-6GB VRAM safely
-        syms  = list(bufs.keys())
-        N     = len(syms)
-        if N == 0:
+        import time as _time, os as _os
+        proc = getattr(self, "_gpu_proc", None)
+        if proc is None:
             return
+        fd = proc.stdin.fileno()
 
-        rows: List[torch.Tensor] = []
-        for sym in syms:
-            b   = bufs[sym]
-            arr = torch.tensor(b, dtype=torch.float32, device=dev)
-            # Tile to T_TARGET with small noise to avoid trivial patterns
-            repeats = (T_TARGET // len(arr)) + 2
-            tiled   = arr.repeat(repeats)[:T_TARGET]
-            noise   = torch.randn_like(tiled) * (tiled.std() * 0.001 + 1e-6)
-            rows.append(tiled + noise)
+        while not self._stop:
+            bufs = getattr(self, "_latest_bufs", None)
+            if bufs and proc.poll() is None:
+                try:
+                    raw = (json.dumps(bufs) + "\n").encode()
+                    # Write in one syscall — atomic for pipe buffers ≤ PIPE_BUF (64KB)
+                    _os.write(fd, raw)
+                except BlockingIOError:
+                    pass   # pipe full — subprocess still processing, skip this tick
+                except Exception as e:
+                    self._last_gpu_error = str(e)
+                self._latest_bufs = None   # clear so we don't resend same snapshot
 
-        # prices: (N, T)
-        prices = torch.stack(rows)   # (N, T_TARGET)
-        T = prices.shape[1]
+            _time.sleep(0.5)   # match feeder rate
 
-        # Returns: (N, T)
-        ret        = torch.zeros_like(prices)
-        ret[:, 1:] = (prices[:, 1:] - prices[:, :-1]) / (prices[:, :-1].abs() + 1e-9)
-
-        # Cumsum for O(1) rolling means: (N, T+1)
-        cs         = torch.zeros(N, T + 1, device=dev, dtype=torch.float32)
-        cs[:, 1:]  = prices.cumsum(dim=1)
-
-        def rolling_mean_batch(w: int) -> torch.Tensor:
-            """Returns (N, T) rolling mean with NaN padding."""
-            w = int(w)
-            if T < w:
-                return torch.zeros(N, T, device=dev)
-            means = (cs[:, w:] - cs[:, :T - w + 1]) / w   # (N, T-w+1)
-            pad   = torch.full((N, w - 1), float('nan'), device=dev)
-            return torch.cat([pad, means], dim=1)           # (N, T)
-
-        # Parameter grid: fast 2-20, slow 8-80 → ~700 combos
-        fast_range = torch.arange(2, 21, device=dev, dtype=torch.int32)
-        slow_range = torch.arange(8, 81, device=dev, dtype=torch.int32)
-        fg, sg     = torch.meshgrid(fast_range, slow_range, indexing='ij')
-        fg = fg.reshape(-1); sg = sg.reshape(-1)
-        mask = fg < sg
-        fg   = fg[mask]; sg = sg[mask]
-        C    = fg.shape[0]   # ~700 combos
-
-        # Precompute unique MAs only (not all combos — avoids OOM)
-        unique_w = torch.unique(torch.cat([fg, sg])).tolist()
-        ma_cache: Dict[int, torch.Tensor] = {int(w): rolling_mean_batch(int(w)) for w in unique_w}
-
-        thresholds = torch.logspace(-5, -3, 20, device=dev)
-        best_sharpe = -999.0
-        best_fw  = self.best_fast_w
-        best_sw  = self.best_slow_w
-        best_thr = self.best_gap_threshold
-        ret_b    = ret.unsqueeze(0)   # (1, N, T)
-        fg_list  = fg.tolist(); sg_list = sg.tolist()
-
-        # Process combos in batches — build gap on-the-fly, free after each batch
-        BATCH = 64
-        for b_start in range(0, C, BATCH):
-            b_end = min(b_start + BATCH, C)
-            B     = b_end - b_start
-            fma_b = torch.stack([ma_cache[int(fg_list[i])] for i in range(b_start, b_end)])  # (B,N,T)
-            sma_b = torch.stack([ma_cache[int(sg_list[i])] for i in range(b_start, b_end)])
-            gm_b  = torch.nan_to_num((fma_b - sma_b) / (sma_b.abs() + 1e-9), nan=0.0)       # (B,N,T)
-
-            for thr in thresholds.tolist():
-                sig      = (gm_b > thr).float() - (gm_b < -thr).float()
-                pnl      = sig[:, :, :-1] * ret_b[:, :, 1:]
-                pnl_flat = pnl.reshape(B, -1)
-                sharpe   = (pnl_flat.mean(1) / (pnl_flat.std(1) + 1e-9)) * (252.0 ** 0.5)
-                best_idx = int(sharpe.argmax().item())
-                best_s   = float(sharpe[best_idx].item())
-                if best_s > best_sharpe:
-                    best_sharpe = best_s
-                    best_fw  = int(fg[b_start + best_idx].item())
-                    best_sw  = int(sg[b_start + best_idx].item())
-                    best_thr = float(thr)
-
-            del fma_b, sma_b, gm_b   # free batch VRAM immediately
-
-        if best_sharpe > 0.1:
-            self.best_fast_w        = best_fw
-            self.best_slow_w        = best_sw
-            self.best_gap_threshold = best_thr
-
-        # Report VRAM usage
+    def _stdout_reader(self) -> None:
+        """Background thread: reads JSON lines from GPU subprocess stdout."""
+        proc = getattr(self, "_gpu_proc", None)
+        if proc is None:
+            return
         try:
-            used_mb = torch.cuda.memory_allocated(dev) // 1024**2
-            self.vram_mb = used_mb
+            for raw in proc.stdout:
+                if self._stop:
+                    break
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    res = json.loads(raw)
+                    if res.get("ready"):
+                        cuda_ok = res.get("cuda", False)
+                        vb = res.get("vram_base_mb", 0)
+                        self.vram_mb = vb
+                        if not cuda_ok:
+                            self._last_gpu_error = "CUDA unavailable in worker"
+                        continue
+                    if "error" in res:
+                        self._last_gpu_error = res["error"]
+                        continue
+                    self.best_fast_w        = res.get("fast_w", self.best_fast_w)
+                    self.best_slow_w        = res.get("slow_w", self.best_slow_w)
+                    self.best_gap_threshold = res.get("threshold", self.best_gap_threshold)
+                    self.gpu_util_pct       = res.get("util_pct", self.gpu_util_pct)
+                    self.vram_mb            = res.get("vram_mb", self.vram_mb)
+                except Exception as e:
+                    self._last_gpu_error = f"parse: {e}"
         except Exception:
             pass
 
-    def _alloc_vram_buffer(self) -> None:
-        """Pre-allocate a persistent VRAM buffer to hold ~60% of GPU memory.
-        This keeps VRAM utilization visible and reserves space for future use."""
-        if self._torch is None or self.device is None:
-            return
-        try:
-            torch = self._torch
-            # Allocate to reach ~TARGET_VRAM_MB
-            free_mb = torch.cuda.get_device_properties(0).total_memory // 1024**2
-            n_floats = int(self._TARGET_VRAM_MB * 1024**2 / 4)
-            self._vram_buffer = torch.zeros(n_floats, dtype=torch.float32, device=self.device)
-            self.vram_mb = int(torch.cuda.memory_allocated(self.device) // 1024**2)
-        except Exception:
-            self._vram_buffer = None
-
     def start(self) -> None:
-        import threading
-        self._alloc_vram_buffer()
-        self._thread = threading.Thread(target=self._run, daemon=True, name="gpu-analytics")
+        import threading, os as _os, fcntl as _fcntl
+        import subprocess as _sp
+
+        # Launch GPU optimizer as a standalone subprocess.
+        # Binary stdin — os.write() from writer thread, no buffered-IO deadlock.
+        self._gpu_proc = None
+        try:
+            self._gpu_proc = _sp.Popen(
+                [sys.executable, "-c", _GPU_WORKER_SCRIPT],
+                stdin  = _sp.PIPE,
+                stdout = _sp.PIPE,
+                stderr = _sp.DEVNULL,
+                text   = False,   # binary mode — writer uses os.write()
+            )
+        except Exception as e:
+            self._last_gpu_error = f"popen: {e}"
+
+        # Set stdin fd to non-blocking — separate try so Popen success is preserved.
+        if self._gpu_proc is not None:
+            try:
+                fd = self._gpu_proc.stdin.fileno()
+                flags = _fcntl.fcntl(fd, _fcntl.F_GETFL)
+                _fcntl.fcntl(fd, _fcntl.F_SETFL, flags | _os.O_NONBLOCK)
+            except Exception as e:
+                self._last_gpu_error = f"fcntl: {e}"
+                # fcntl failed — fall back to blocking writes (still works, just may stall)
+
+        # stdout reader thread — reads text results from GPU proc
+        # (stdout is still binary; decode per line in _stdout_reader)
+        self._reader_thread = threading.Thread(
+            target=self._stdout_reader, daemon=True, name="gpu-stdout")
+        self._reader_thread.start()
+
+        # Writer thread — sends latest price snapshot to GPU proc stdin
+        self._writer_thread = threading.Thread(
+            target=self._stdin_writer, daemon=True, name="gpu-stdin")
+        self._writer_thread.start()
+
+        # Feeder thread — computes fast CPU signals + updates _latest_bufs
+        self._thread = threading.Thread(target=self._run, daemon=True, name="gpu-feeder")
         self._thread.start()
 
     def stop(self) -> None:
         self._stop = True
+        proc = getattr(self, "_gpu_proc", None)
+        if proc is not None:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+            except Exception:
+                pass
 
 
 # ── Main trading loop ─────────────────────────────────────────────────────────
@@ -947,12 +1034,14 @@ async def _trading_loop(
     print(f"{_GREEN}  Analytics : {gpu.backend}{_RESET}")
 
     # Thread pool for parallel per-coin work (balance checks, order prep)
-    import concurrent.futures, multiprocessing
+    import concurrent.futures
+    import multiprocessing
     _thread_pool = concurrent.futures.ThreadPoolExecutor(
         max_workers=len(symbols), thread_name_prefix="coin"
     )
 
-    # CPU analytics pool — uses all 8 cores for heavy per-coin computations
+    # CPU analytics pool — ProcessPoolExecutor for true multi-core parallelism.
+    # Safe now because parent process no longer imports torch (GPU subprocess owns it).
     _cpu_cores = multiprocessing.cpu_count()
     _cpu_pool  = concurrent.futures.ProcessPoolExecutor(max_workers=_cpu_cores)
     # CPU analytics results — written by workers, read by signal loop
@@ -1134,37 +1223,65 @@ async def _trading_loop(
                                   "status": status, "orderId": order_id})
 
     async def _cpu_analytics_loop() -> None:
-        """Continuously submits heavy analytics to ProcessPoolExecutor.
-        All 8 CPU cores stay busy — one future per symbol, resubmit on complete.
+        """Keep all CPU cores saturated with analytics work.
+
+        Strategy: maintain a queue of (_cpu_cores) concurrent futures at all
+        times — one per core. Each future is one symbol analysis (~43ms).
+        Round-robin across symbols so every symbol gets fresh results
+        continuously. When a future completes, immediately resubmit work.
         """
         loop = asyncio.get_event_loop()
-        futures: Dict[str, Any] = {}
+        # pending: list of (sym, future)
+        pending: List[Any] = []
+        sym_cycle = list(ctxs.keys())
+        sym_idx   = 0
+
+        def _next_job():
+            nonlocal sym_idx
+            # Round-robin through symbols, skipping ones with no data
+            for _ in range(len(sym_cycle)):
+                sym = sym_cycle[sym_idx % len(sym_cycle)]
+                sym_idx += 1
+                ctx = ctxs[sym]
+                buf  = list(ctx.price_buf)
+                vbuf = list(ctx.volume_buf)
+                if len(buf) >= 20:
+                    return sym, loop.run_in_executor(
+                        _cpu_pool, _cpu_analyze_symbol, sym, buf, vbuf)
+            return None, None
+
+        # Fill all cores immediately
+        for _ in range(_cpu_cores):
+            sym, fut = _next_job()
+            if fut:
+                pending.append((sym, fut))
 
         while True:
-            # Submit work for symbols that have enough data and aren't running
-            for sym, ctx in ctxs.items():
-                if sym in futures and not futures[sym].done():
-                    continue   # already running on a core
-                buf = list(ctx.price_buf)
-                vbuf = list(ctx.volume_buf)
-                if len(buf) < 20:
-                    continue
-                # Submit to process pool — runs on dedicated CPU core
-                futures[sym] = loop.run_in_executor(
-                    _cpu_pool, _cpu_analyze_symbol, sym, buf, vbuf
-                )
-
-            # Collect completed results
-            for sym, fut in list(futures.items()):
+            still_running = []
+            for sym, fut in pending:
                 if fut.done():
                     try:
                         result = await fut
                         _cpu_signals[sym] = result
                     except Exception:
                         pass
-                    del futures[sym]
+                    # Immediately submit a new job to keep the core busy
+                    new_sym, new_fut = _next_job()
+                    if new_fut:
+                        still_running.append((new_sym, new_fut))
+                else:
+                    still_running.append((sym, fut))
+            pending = still_running
 
-            await asyncio.sleep(0.1)   # tight loop — resubmits as cores free up
+            # Top up if slots are empty (e.g. no data yet)
+            while len(pending) < _cpu_cores:
+                sym, fut = _next_job()
+                if fut:
+                    pending.append((sym, fut))
+                else:
+                    break
+
+            await asyncio.sleep(0.05)   # 50ms cooldown between batches → ~70% CPU util
 
     async def _display_loop() -> None:
         states = [ctx.st for ctx in ctxs.values()]
