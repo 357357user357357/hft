@@ -280,7 +280,8 @@ def _clear() -> None:
 
 def _render(states: List["LiveState"], live_mode: bool, client: Optional[BybitClient],
             equity: float, daily_pnl: float, total_trades: int, winning: int,
-            gpu: Optional["GpuAnalytics"] = None) -> None:
+            gpu: Optional["GpuAnalytics"] = None,
+            cpu_signals: Optional[Dict[str, Dict[str, float]]] = None) -> None:
     _clear()
     mode_str = f"{_RED}{_BOLD}LIVE ORDERS{_RESET}" if live_mode else f"{_YELLOW}PAPER MODE{_RESET}"
     bal_str = ""
@@ -320,7 +321,15 @@ def _render(states: List["LiveState"], live_mode: bool, client: Optional[BybitCl
                        f" {_pnl_col(unreal)}{unreal:+.2f}%{_RESET} {_DIM}{held}s{_RESET}")
         elif not st.in_position:
             pos_str = f"  {_DIM}flat{_RESET}"
-        print(f"  {st.symbol:<12} {price_str}  {pos_str}")
+        # CPU analytics annotation
+        cpu_str = ""
+        if cpu_signals:
+            cs = cpu_signals.get(st.symbol, {})
+            if cs:
+                h = cs.get("hurst", 0.5); o = cs.get("ofi", 0.5)
+                sh = cs.get("sharpe", 0.0)
+                cpu_str = (f"  {_DIM}H={h:.2f} OFI={o:.2f} Sh={sh:+.1f}{_RESET}")
+        print(f"  {st.symbol:<12} {price_str}  {pos_str}{cpu_str}")
 
     print(f"\n{_BOLD}{'─'*70}{_RESET}")
     print(f"  {_DIM}Ctrl+C to stop{_RESET}", flush=True)
@@ -473,6 +482,98 @@ class SymbolCtx:
     min_qty:    float = 0.0001
     price_buf:  List[float] = field(default_factory=list)
     volume_buf: List[float] = field(default_factory=list)
+
+
+# ── CPU analytics workers (top-level for multiprocessing pickle) ─────────────
+
+def _cpu_analyze_symbol(sym: str, prices: List[float], volumes: List[float]) -> Dict[str, float]:
+    """Heavy CPU analytics for one symbol — runs in a separate process.
+
+    Computes:
+      • Hurst exponent (R/S analysis) — detects mean-reversion vs trend
+      • Order flow imbalance — buy volume fraction (proxy from price direction)
+      • Autocorrelation lag-1 — momentum persistence
+      • Rolling Sharpe of recent returns
+      • Cointegration score vs mean (ADF-lite)
+
+    Called in ProcessPoolExecutor — one process per symbol, all 8 cores used.
+    """
+    import math
+
+    result: Dict[str, float] = {"sym": 0.0, "hurst": 0.5, "ofi": 0.5,
+                                 "autocorr": 0.0, "sharpe": 0.0, "adf": 0.0}
+    n = len(prices)
+    if n < 20:
+        return result
+
+    # ── Returns ───────────────────────────────────────────────────────────────
+    rets = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, n)]
+    if not rets:
+        return result
+
+    # ── Hurst exponent via R/S analysis ──────────────────────────────────────
+    def _hurst(ts: List[float]) -> float:
+        if len(ts) < 8:
+            return 0.5
+        ns, rs_vals = [], []
+        for lag in [max(4, len(ts)//8), max(8, len(ts)//4), max(16, len(ts)//2), len(ts)]:
+            lag = min(lag, len(ts))
+            sub = ts[-lag:]
+            mean_s = sum(sub) / len(sub)
+            dev = [x - mean_s for x in sub]
+            cumdev = []
+            c = 0.0
+            for d in dev:
+                c += d; cumdev.append(c)
+            R = max(cumdev) - min(cumdev)
+            variance = sum(d*d for d in dev) / len(dev)
+            S = variance ** 0.5
+            if S > 1e-10 and R > 0:
+                ns.append(lag); rs_vals.append(R / S)
+        if len(ns) < 2:
+            return 0.5
+        # log-log regression
+        log_n = [math.log(x) for x in ns]
+        log_rs = [math.log(x) for x in rs_vals]
+        n2 = len(log_n)
+        mx = sum(log_n) / n2; my = sum(log_rs) / n2
+        num = sum((log_n[i]-mx)*(log_rs[i]-my) for i in range(n2))
+        den = sum((log_n[i]-mx)**2 for i in range(n2))
+        return num / den if den > 1e-10 else 0.5
+
+    result["hurst"] = _hurst(rets[-min(200, len(rets)):])
+
+    # ── Order flow imbalance (buy fraction from upticks) ──────────────────────
+    upticks = sum(1 for r in rets[-50:] if r > 0)
+    result["ofi"] = upticks / min(50, len(rets))
+
+    # ── Lag-1 autocorrelation ─────────────────────────────────────────────────
+    w = min(50, len(rets) - 1)
+    r1 = rets[-w:]; r2 = rets[-w-1:-1]
+    mean1 = sum(r1)/w; mean2 = sum(r2)/w
+    num = sum((r1[i]-mean1)*(r2[i]-mean2) for i in range(w))
+    d1  = sum((x-mean1)**2 for x in r1) ** 0.5
+    d2  = sum((x-mean2)**2 for x in r2) ** 0.5
+    result["autocorr"] = num / (d1*d2 + 1e-10)
+
+    # ── Rolling Sharpe (last 30 returns) ─────────────────────────────────────
+    rw = rets[-30:]
+    mean_r = sum(rw) / len(rw)
+    std_r  = (sum((x-mean_r)**2 for x in rw) / len(rw)) ** 0.5
+    result["sharpe"] = (mean_r / (std_r + 1e-10)) * (252 ** 0.5)
+
+    # ── ADF-lite: test if spread is stationary (mean-reverting) ──────────────
+    # Simplified: regress Δp on p(t-1), check coefficient < 0
+    pw = prices[-min(60, n):]
+    delta = [pw[i] - pw[i-1] for i in range(1, len(pw))]
+    lag_p = pw[:-1]
+    mean_d = sum(delta)/len(delta); mean_l = sum(lag_p)/len(lag_p)
+    cov = sum((delta[i]-mean_d)*(lag_p[i]-mean_l) for i in range(len(delta)))
+    var = sum((x-mean_l)**2 for x in lag_p)
+    beta = cov / (var + 1e-10)
+    result["adf"] = beta   # negative = mean-reverting
+
+    return result
 
 
 # ── GPU analytics engine ──────────────────────────────────────────────────────
@@ -826,10 +927,17 @@ async def _trading_loop(
     print(f"{_GREEN}  Analytics : {gpu.backend}{_RESET}")
 
     # Thread pool for parallel per-coin work (balance checks, order prep)
-    import concurrent.futures
+    import concurrent.futures, multiprocessing
     _thread_pool = concurrent.futures.ThreadPoolExecutor(
         max_workers=len(symbols), thread_name_prefix="coin"
     )
+
+    # CPU analytics pool — uses all 8 cores for heavy per-coin computations
+    _cpu_cores = multiprocessing.cpu_count()
+    _cpu_pool  = concurrent.futures.ProcessPoolExecutor(max_workers=_cpu_cores)
+    # CPU analytics results — written by workers, read by signal loop
+    _cpu_signals: Dict[str, Dict[str, float]] = {}
+    _cpu_lock = asyncio.Lock()
 
     # WS order client — faster than REST (~244ms vs ~471ms)
     ws_orders: Optional[WsOrderClient] = None
@@ -951,8 +1059,17 @@ async def _trading_loop(
 
                 # Use GPU-optimized thresholds (updated every ~1s by optimizer)
                 thr = gpu.best_gap_threshold
-                enter_long  = gap >  thr and zscore > -1.5
-                enter_short = gap < -thr and zscore <  1.5
+
+                # CPU analytics filter: Hurst + OFI confirm signal quality
+                cpu_sig = _cpu_signals.get(sym, {})
+                hurst   = cpu_sig.get("hurst", 0.5)
+                ofi     = cpu_sig.get("ofi", 0.5)   # >0.5 = buy pressure
+
+                # Hurst < 0.45 = strong mean-reversion (good for our strategy)
+                # OFI confirms direction
+                hurst_ok = hurst < 0.55   # not trending away from us
+                enter_long  = gap >  thr and zscore > -1.5 and hurst_ok and ofi > 0.45
+                enter_short = gap < -thr and zscore <  1.5 and hurst_ok and ofi < 0.55
 
                 if not (enter_long or enter_short):
                     continue
@@ -996,22 +1113,57 @@ async def _trading_loop(
                                   "price": f"{price:.4f}",
                                   "status": status, "orderId": order_id})
 
+    async def _cpu_analytics_loop() -> None:
+        """Continuously submits heavy analytics to ProcessPoolExecutor.
+        All 8 CPU cores stay busy — one future per symbol, resubmit on complete.
+        """
+        loop = asyncio.get_event_loop()
+        futures: Dict[str, Any] = {}
+
+        while True:
+            # Submit work for symbols that have enough data and aren't running
+            for sym, ctx in ctxs.items():
+                if sym in futures and not futures[sym].done():
+                    continue   # already running on a core
+                buf = list(ctx.price_buf)
+                vbuf = list(ctx.volume_buf)
+                if len(buf) < 20:
+                    continue
+                # Submit to process pool — runs on dedicated CPU core
+                futures[sym] = loop.run_in_executor(
+                    _cpu_pool, _cpu_analyze_symbol, sym, buf, vbuf
+                )
+
+            # Collect completed results
+            for sym, fut in list(futures.items()):
+                if fut.done():
+                    try:
+                        result = await fut
+                        _cpu_signals[sym] = result
+                    except Exception:
+                        pass
+                    del futures[sym]
+
+            await asyncio.sleep(0.1)   # tight loop — resubmits as cores free up
+
     async def _display_loop() -> None:
         states = [ctx.st for ctx in ctxs.values()]
         while True:
             _render(states, live_mode, client,
-                    equity, daily_pnl, total_trades, winning, gpu)
+                    equity, daily_pnl, total_trades, winning, gpu, _cpu_signals)
             await asyncio.sleep(display_interval)
 
     try:
         await asyncio.gather(
-            asyncio.create_task(_ws_loop(),      name="ws"),
-            asyncio.create_task(_signal_loop(),  name="signal"),
-            asyncio.create_task(_display_loop(), name="display"),
+            asyncio.create_task(_ws_loop(),             name="ws"),
+            asyncio.create_task(_signal_loop(),         name="signal"),
+            asyncio.create_task(_cpu_analytics_loop(),  name="cpu-analytics"),
+            asyncio.create_task(_display_loop(),        name="display"),
         )
     finally:
         gpu.stop()
         _thread_pool.shutdown(wait=False)
+        _cpu_pool.shutdown(wait=False)
         if ws_orders:
             await ws_orders.close()
 
