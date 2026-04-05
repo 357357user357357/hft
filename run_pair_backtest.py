@@ -36,62 +36,44 @@ from pair_backtest import PairBacktest, PairBacktestConfig, PairStats, run_all_p
 def _load_symbol(symbol: str, max_bars: int = 5000) -> Tuple[List[float], List[float]]:
     """Load price + volume series for one symbol.
 
-    Uses the same data pipeline as run_signal_backtest.py:
-      1. Check for downloaded Binance CSV in ./data/<symbol>_*.csv
-      2. Fall back to synthetic data if unavailable
+    Mirrors run_signal_backtest.py exactly:
+      1. Scan ./data/ for  <SYMBOL>-aggTrades-*.zip  (same naming convention)
+      2. Load aggTrades, resample to bars (bar_size=100 trades per bar)
+      3. Fall back to synthetic random-walk if no file found
 
     Returns (prices, volumes).
     """
-    from download_data import SYMBOLS as _DS  # noqa
-    import glob
+    from pathlib import Path
+    from data import load_agg_trades_csv
 
-    data_dir = os.path.join(os.path.dirname(__file__), "data")
-    pattern  = os.path.join(data_dir, f"{symbol}_*.csv*")
-    files    = sorted(glob.glob(pattern))
+    data_dir = Path(os.path.dirname(__file__)) / "data"
+    # Match the same glob pattern as run_signal_backtest.py
+    zips = sorted(data_dir.glob(f"{symbol}-aggTrades-*.zip"))
 
-    if files:
-        # Load from CSV (same as run_signal_backtest.py)
+    if zips:
         try:
-            from data import load_trades
-            trades = load_trades(files[-1])
-            # Build OHLCV bars at 1-minute granularity
+            trades   = load_agg_trades_csv(str(zips[-1]))
+            bar_size = max(1, len(trades) // max_bars)
             prices: List[float] = []
             volumes: List[float] = []
-            bar_start = trades[0].transact_time // 60000
-            bar_price = trades[0].price
-            bar_vol   = 0.0
-            for t in trades:
-                bar = t.transact_time // 60000
-                if bar != bar_start:
-                    prices.append(bar_price)
-                    volumes.append(bar_vol)
-                    bar_start = bar
-                    bar_price = t.price
-                    bar_vol   = 0.0
-                bar_price = t.price
-                bar_vol  += t.quantity * t.price
-            if bar_vol > 0:
-                prices.append(bar_price)
-                volumes.append(bar_vol)
+            for i in range(0, len(trades), bar_size):
+                chunk = trades[i:i + bar_size]
+                prices.append((chunk[0].price + chunk[-1].price) / 2)
+                volumes.append(sum(t.quantity for t in chunk))
             return prices[-max_bars:], volumes[-max_bars:]
         except Exception:
             pass
 
-    # Synthetic fallback — use same approach as run_signal_backtest.py
-    try:
-        from run_signal_backtest import _load_prices
-        prices, volumes = _load_prices(symbol, max_bars=max_bars)
-        return prices, volumes
-    except Exception:
-        pass
-
+    # Synthetic fallback — realistic price levels so Kalman β is sensible
     import random
     random.seed(hash(symbol) % (2**31))
-    base = {"BTC": 45000, "ETH": 2500, "SOL": 100, "BNB": 300,
-             "LTC": 80, "XRP": 0.5, "LINK": 15, "ADA": 0.4, "DOGE": 0.08}.get(
-        symbol.replace("USDT",""), 100.0)
-    prices_s = [base]
-    vols_s   = []
+    base = {
+        "BTCUSDT": 45000, "ETHUSDT": 2500, "SOLUSDT": 100, "BNBUSDT": 300,
+        "LTCUSDT": 80, "XRPUSDT": 0.5, "LINKUSDT": 15,
+        "ADAUSDT": 0.4, "DOGEUSDT": 0.08,
+    }.get(symbol, 100.0)
+    prices_s: List[float] = [base]
+    vols_s:   List[float] = []
     for _ in range(max_bars - 1):
         prices_s.append(prices_s[-1] * (1 + random.gauss(0, 0.012)))
         vols_s.append(random.uniform(100_000, 2_000_000))

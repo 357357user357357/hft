@@ -792,12 +792,21 @@ fn run_algo_sim(
     avg_trig_pct: f64,
     vec_vel_bars: usize,
     vec_min_vel:  f64,
-) -> (i32, i32, f64) {
-    // Returns (total_trades, winning_trades, total_pnl_pct)
+) -> (i32, i32, f64, f64, f64) {
+    // Returns (total_trades, winning_trades, total_pnl_pct, sharpe_ratio, max_drawdown_pct)
     let n = zscores.len();
     let mut total_trades = 0i32;
     let mut winning      = 0i32;
     let mut total_pnl    = 0.0f64;
+
+    // For Sharpe: online mean + M2 over per-trade P&Ls (Welford)
+    let mut pnl_mean = 0.0f64;
+    let mut pnl_m2   = 0.0f64;
+
+    // For max drawdown: track cumulative equity curve
+    let mut cum_equity = 0.0f64;
+    let mut peak       = 0.0f64;
+    let mut max_dd     = 0.0f64;
 
     let mut in_pos      = false;
     let mut pos_side    = 0i8;   // +1 = long spread, -1 = short spread
@@ -864,6 +873,20 @@ fn run_algo_sim(
                 total_pnl    += net_pct;
                 total_trades += 1;
                 if net_pct > 0.0 { winning += 1; }
+
+                // Welford online Sharpe update
+                let k = total_trades as f64;
+                let delta  = net_pct - pnl_mean;
+                pnl_mean  += delta / k;
+                let delta2 = net_pct - pnl_mean;
+                pnl_m2    += delta * delta2;
+
+                // Max drawdown update
+                cum_equity += net_pct;
+                if cum_equity > peak { peak = cum_equity; }
+                let dd = if peak > 0.0 { (peak - cum_equity) / peak * 100.0 } else { 0.0 };
+                if dd > max_dd { max_dd = dd; }
+
                 in_pos   = false;
                 pos_side = 0;
             }
@@ -915,7 +938,14 @@ fn run_algo_sim(
         }
     }
 
-    (total_trades, winning, total_pnl)
+    // Annualised Sharpe from per-trade P&Ls (assuming ~252 trades/year proxy)
+    let sharpe = if total_trades > 1 {
+        let variance = pnl_m2 / (total_trades as f64 - 1.0);
+        let std = variance.sqrt();
+        if std > 1e-12 { pnl_mean / std * (252.0f64).sqrt() } else { 0.0 }
+    } else { 0.0 };
+
+    (total_trades, winning, total_pnl, sharpe, max_dd)
 }
 
 /// Full pair backtest simulation — all 4 algorithms in one Rust pass.
@@ -978,7 +1008,9 @@ fn pair_backtest_run(
     avg_trig_pct: f64,
     vec_vel_bars: usize,
     vec_min_vel:  f64,
-) -> PyResult<(i32,i32,f64, i32,i32,f64, i32,i32,f64, i32,i32,f64)> {
+) -> PyResult<Vec<f64>> {
+    // Returns flat Vec<f64> of length 20: (trades,wins,pnl,sharpe,mdd) × 4 algos.
+    // PyO3 only auto-converts tuples ≤ 12 elements; Vec<f64> has no limit.
     let n = zscores.len().min(spreads.len()).min(prices_a.len());
     // Total round-trip cost in %.
     // Python passes fee_pct=0.04 meaning 4 bps = 0.04%.
@@ -1006,24 +1038,30 @@ fn pair_backtest_run(
         vec_vel_bars, vec_min_vel,
     );
 
-    let (st, sw, sp) = run_algo_sim(0, common_args.0, common_args.1, common_args.2,
+    let (st, sw, sp, s_sharpe, s_mdd) = run_algo_sim(0, common_args.0, common_args.1, common_args.2,
         common_args.3, common_args.4, common_args.5, common_args.6, common_args.7,
         common_args.8, common_args.9, common_args.10, common_args.11, common_args.12,
         common_args.13, common_args.14);
-    let (dt, dw, dp) = run_algo_sim(1, common_args.0, common_args.1, common_args.2,
+    let (dt, dw, dp, d_sharpe, d_mdd) = run_algo_sim(1, common_args.0, common_args.1, common_args.2,
         common_args.3, common_args.4, common_args.5, common_args.6, common_args.7,
         common_args.8, common_args.9, common_args.10, common_args.11, common_args.12,
         common_args.13, common_args.14);
-    let (at, aw, ap) = run_algo_sim(2, common_args.0, common_args.1, common_args.2,
+    let (at, aw, ap, a_sharpe, a_mdd) = run_algo_sim(2, common_args.0, common_args.1, common_args.2,
         common_args.3, common_args.4, common_args.5, common_args.6, common_args.7,
         common_args.8, common_args.9, common_args.10, common_args.11, common_args.12,
         common_args.13, common_args.14);
-    let (vt, vw, vp) = run_algo_sim(3, common_args.0, common_args.1, common_args.2,
+    let (vt, vw, vp, v_sharpe, v_mdd) = run_algo_sim(3, common_args.0, common_args.1, common_args.2,
         common_args.3, common_args.4, common_args.5, common_args.6, common_args.7,
         common_args.8, common_args.9, common_args.10, common_args.11, common_args.12,
         common_args.13, common_args.14);
 
-    Ok((st, sw, sp,  dt, dw, dp,  at, aw, ap,  vt, vw, vp))
+    // Returns flat Vec<f64> of 20 values: (trades,wins,pnl,sharpe,mdd) × 4
+    Ok(vec![
+        st as f64, sw as f64, sp, s_sharpe, s_mdd,
+        dt as f64, dw as f64, dp, d_sharpe, d_mdd,
+        at as f64, aw as f64, ap, a_sharpe, a_mdd,
+        vt as f64, vw as f64, vp, v_sharpe, v_mdd,
+    ])
 }
 
 #[pymodule]

@@ -257,35 +257,30 @@ class PairBacktest:
                 cfg.avg_short_bars, cfg.avg_long_bars, cfg.avg_trigger_pct,
                 cfg.vec_velocity_bars, cfg.vec_min_velocity,
             )
-            # raw = (shot_trades, shot_wins, shot_pnl,
-            #        depth_trades, depth_wins, depth_pnl,
-            #        avg_trades,   avg_wins,   avg_pnl,
-            #        vec_trades,   vec_wins,   vec_pnl)
-            # cast() to a concrete type so Pyright stops propagating Any
+            # raw = 20-tuple: (trades, wins, pnl, sharpe, mdd) × 4 algos
+            # Rust computes Sharpe (Welford online) and MDD inline — no Python needed.
+            # raw = Vec<f64> of 20 values: (trades,wins,pnl,sharpe,mdd) × 4 algos
+            # Rust computes Sharpe via Welford online algorithm and proper MDD.
             from typing import cast as _cast
-            _r: List[float] = list(_cast(tuple, raw))  # type: ignore[arg-type]
-            _r = [float(x) for x in _r]  # type: ignore[misc]
-            _algo_raw: List[Tuple[str, int, int, float]] = [
-                ("shot",       int(_r[0]),  int(_r[1]),  _r[2]),
-                ("depth_shot", int(_r[3]),  int(_r[4]),  _r[5]),
-                ("averages",   int(_r[6]),  int(_r[7]),  _r[8]),
-                ("vector",     int(_r[9]),  int(_r[10]), _r[11]),
+            _r: List[float] = [float(x) for x in _cast(tuple, raw)]  # type: ignore[arg-type,misc]
+            _algo_raw5: List[Tuple[str, int, int, float, float, float]] = [
+                ("shot",       int(_r[0]),  int(_r[1]),  _r[2],  _r[3],  _r[4]),
+                ("depth_shot", int(_r[5]),  int(_r[6]),  _r[7],  _r[8],  _r[9]),
+                ("averages",   int(_r[10]), int(_r[11]), _r[12], _r[13], _r[14]),
+                ("vector",     int(_r[15]), int(_r[16]), _r[17], _r[18], _r[19]),
             ]
-
-            for algo_name, total, wins, pnl in _algo_raw:
+            for algo_name, total, wins, pnl, sharpe, mdd in _algo_raw5:
                 s = PairStats(algo=algo_name, pair=pair_label)
-                s.coint_adf = adf_stat; s.coint_pval = coint_p
-                s.total_trades = total; s.winning_trades = wins
+                s.coint_adf = adf_stat;  s.coint_pval = coint_p
+                s.total_trades = total;  s.winning_trades = wins
                 s.losing_trades = total - wins
-                s.total_pnl_pct = pnl
+                s.total_pnl_pct = pnl;   s.sharpe_ratio = sharpe
+                s.max_drawdown_pct = mdd
                 if total > 0:
                     s.win_rate    = wins / total
                     s.avg_pnl_pct = pnl / total
-                    wins_pnl  = pnl * s.win_rate
-                    loses_pnl = pnl * (1.0 - s.win_rate)
-                    s.profit_factor = abs(wins_pnl / loses_pnl) if abs(loses_pnl) > 1e-12 else float("inf")
-                    avg = pnl / total
-                    s.sharpe_ratio = avg / (abs(avg) * 0.5 + 1e-9) * math.sqrt(252) if avg != 0 else 0.0
+                    wp = pnl * s.win_rate;  lp = pnl * (1.0 - s.win_rate)
+                    s.profit_factor = abs(wp / lp) if abs(lp) > 1e-12 else float("inf")
                 results[algo_name] = s
             return results
 
