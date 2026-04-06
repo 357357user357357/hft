@@ -842,8 +842,22 @@ def optimize(bufs):
                 best_thr = float(thr)
         del fma, sma, gm
     elapsed  = time.monotonic() - t0
-    util_pct = min(100.0, elapsed / 1.0 * 100)
+    # Real GPU utilization via nvidia-smi (accurate), not wall-clock proxy
+    util_pct = 0.0
     vram_mb  = int(torch.cuda.memory_allocated(dev) // 1024**2)
+    try:
+        import subprocess as _sp
+        r = _sp.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if r.returncode == 0:
+            parts = r.stdout.strip().split(",")
+            util_pct = float(parts[0].strip())
+            vram_mb  = int(parts[1].strip())
+    except Exception:
+        util_pct = min(100.0, elapsed / 1.0 * 100)   # fallback
     return {"fast_w": best_fw, "slow_w": best_sw, "threshold": best_thr,
             "util_pct": util_pct, "vram_mb": vram_mb}
 
@@ -924,9 +938,10 @@ class GpuAnalytics:
             self._bufs[sym] = buf[-self.WIN_VOL * 8:]
 
     def _compute_cpu(self, sym: str, buf: List[float]) -> Dict[str, float]:
-        """Pure-Python fallback — uses GPU-optimized windows when available."""
-        fw = self.best_fast_w   # updated by GPU optimizer
-        sw_w = self.best_slow_w
+        """Pure-Python fallback — uses per-symbol GPU-optimized windows when available."""
+        p = self.sym_params.get(sym)
+        fw   = p["fast_w"]    if p else self.best_fast_w
+        sw_w = p["slow_w"]    if p else self.best_slow_w
         n = len(buf)
         if n < fw + 2:
             return {"gap": 0.0, "zscore": 0.0, "vol": 0.0, "n": float(n)}
@@ -985,12 +1000,13 @@ class GpuAnalytics:
         }
 
     # ── Adaptive threshold (updated by optimizer) ────────────────────────────
-    best_gap_threshold: float = 0.00003   # read by signal loop
+    best_gap_threshold: float = 0.00003   # joint default, read by signal loop
     best_fast_w:        int   = 5
     best_slow_w:        int   = 20
     gpu_util_pct:       float = 0.0       # reported to dashboard
     vram_mb:            int   = 0         # VRAM used MB
     _last_gpu_error:    str   = ""        # last optimizer error (for debug)
+    sym_params:         Dict  = {}        # per-symbol {fast_w, slow_w, threshold}
 
     def _run(self) -> None:
         """Feeder thread — snapshot prices every 0.5s, compute fast CPU signals,
@@ -1087,6 +1103,30 @@ class GpuAnalytics:
     def start(self) -> None:
         import threading, os as _os, fcntl as _fcntl
         import subprocess as _sp
+
+        # Load pre-computed per-symbol params from gpu_params.json if available
+        _params_file = os.path.join(os.path.dirname(__file__), "gpu_params.json")
+        if os.path.exists(_params_file):
+            try:
+                with open(_params_file) as _f:
+                    _gp = json.load(_f)
+                if _gp:
+                    self.sym_params = {
+                        sym: {
+                            "fast_w":    int(p.get("fast_w",    self.best_fast_w)),
+                            "slow_w":    int(p.get("slow_w",    self.best_slow_w)),
+                            "threshold": float(p.get("threshold", self.best_gap_threshold)),
+                        }
+                        for sym, p in _gp.items()
+                    }
+                    # Also set joint defaults from average
+                    vals = list(self.sym_params.values())
+                    self.best_fast_w        = int(sum(v["fast_w"]    for v in vals) / len(vals))
+                    self.best_slow_w        = int(sum(v["slow_w"]    for v in vals) / len(vals))
+                    self.best_gap_threshold = sum(v["threshold"] for v in vals) / len(vals)
+                    print(f"  Loaded per-symbol GPU params ({len(self.sym_params)} symbols)")
+            except Exception as _e:
+                print(f"  gpu_params.json load failed: {_e}")
 
         # Launch GPU optimizer as a standalone subprocess.
         # Binary stdin — os.write() from writer thread, no buffered-IO deadlock.
@@ -1448,8 +1488,9 @@ async def _trading_loop(
                 zscore = sig["zscore"]
                 vol    = sig["vol"]
 
-                # Use GPU-optimized thresholds (updated every ~1s by optimizer)
-                thr = gpu.best_gap_threshold
+                # Per-symbol GPU-optimized threshold (falls back to joint default)
+                _sp = gpu.sym_params.get(sym)
+                thr = _sp["threshold"] if _sp else gpu.best_gap_threshold
 
                 # CPU analytics filter: Hurst + OFI confirm signal quality
                 cpu_sig = _cpu_signals.get(sym, {})

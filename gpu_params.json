@@ -1,0 +1,56 @@
+{
+  "ADAUSDT": {
+    "fast_w": 19,
+    "slow_w": 20,
+    "threshold": 0.0004832930280826986,
+    "sharpe": 0.8088
+  },
+  "BNBUSDT": {
+    "fast_w": 7,
+    "slow_w": 9,
+    "threshold": 2.0691391910077073e-05,
+    "sharpe": 0.7507
+  },
+  "BTCUSDT": {
+    "fast_w": 20,
+    "slow_w": 21,
+    "threshold": 0.0003792689531110227,
+    "sharpe": 0.1336
+  },
+  "DOGEUSDT": {
+    "fast_w": 9,
+    "slow_w": 11,
+    "threshold": 0.0010000000474974513,
+    "sharpe": 0.7269
+  },
+  "ETHUSDT": {
+    "fast_w": 6,
+    "slow_w": 8,
+    "threshold": 0.0006158483447507024,
+    "sharpe": 0.4367
+  },
+  "LINKUSDT": {
+    "fast_w": 19,
+    "slow_w": 32,
+    "threshold": 0.00029763521160930395,
+    "sharpe": 0.4355
+  },
+  "LTCUSDT": {
+    "fast_w": 12,
+    "slow_w": 14,
+    "threshold": 0.0001832980487961322,
+    "sharpe": 0.8165
+  },
+  "SOLUSDT": {
+    "fast_w": 13,
+    "slow_w": 16,
+    "threshold": 0.0007847598171792924,
+    "sharpe": 0.1885
+  },
+  "XRPUSDT": {
+    "fast_w": 18,
+    "slow_w": 20,
+    "threshold": 0.0010000000474974513,
+    "sharpe": 0.6322
+  }
+}
