@@ -8,7 +8,7 @@ import io
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import math
 
 
@@ -124,6 +124,56 @@ class SimpleOrderBook:
         if b is not None and a is not None:
             return (b + a) / 2.0
         return None
+
+
+def resample_to_bars(trades: List[AggTrade],
+                     bar_seconds: int = 60) -> "Tuple[List[float], List[float]]":
+    """Resample tick trades to OHLCV time bars. Returns (close_prices, volumes).
+
+    Uses close price of each bar (last trade price in the interval).
+    Bars with no trades are forward-filled from the previous close.
+
+    Args:
+        trades:      List of AggTrade (must be time-sorted, transact_time in ms)
+        bar_seconds: Bar width in seconds (default 60 = 1-minute bars)
+
+    Returns:
+        (prices, volumes) — one entry per completed bar
+    """
+    if not trades:
+        return [], []
+
+    bar_ms   = bar_seconds * 1000
+    t_start  = (trades[0].transact_time  // bar_ms) * bar_ms
+    t_end    = (trades[-1].transact_time // bar_ms) * bar_ms
+
+    # Build bar buckets
+    prices:  List[float] = []
+    volumes: List[float] = []
+    last_close = trades[0].price
+
+    t = t_start
+    trade_idx = 0
+    n = len(trades)
+
+    while t <= t_end:
+        bar_open  = t
+        bar_close = t + bar_ms
+        vol   = 0.0
+        close = last_close   # forward-fill if no trades in bar
+
+        while trade_idx < n and trades[trade_idx].transact_time < bar_close:
+            tr   = trades[trade_idx]
+            close = tr.price
+            vol  += tr.quantity
+            trade_idx += 1
+
+        prices.append(close)
+        volumes.append(vol)
+        last_close = close
+        t += bar_ms
+
+    return prices, volumes
 
 
 def build_synthetic_book(recent_trades: List[AggTrade], levels: int, tick_size: float) -> SimpleOrderBook:

@@ -1,33 +1,35 @@
-"""Download Binance aggTrades data for backtesting
+"""Download aggTrades data for backtesting — Binance or Bybit
 
-Base URL: https://data.binance.vision/?prefix=data/futures/um/monthly/aggTrades
+Binance base URL: https://data.binance.vision/data/futures/um/daily/aggTrades
+Bybit base URL:   https://public.bybit.com/trading/
 
 Usage:
-  # Download 1 day
-  python download_data.py --symbol BTCUSDT --days 1 --start 2024-01-15
+  # Download Binance futures data (default)
+  python download_data.py --symbol BTCUSDT --days 30 --start 2024-01-01
 
-  # Download 7 days (a week)
-  python download_data.py --symbol BTCUSDT --days 7 --start 2024-01-15
+  # Download Bybit spot data (matches live trader)
+  python download_data.py --source bybit --symbol BTCUSDT SOLUSDT --days 30
 
-  # Download multiple symbols
+  # Download Bybit for all watchlist symbols
+  python download_data.py --source bybit --preset watchlist --days 30
+
+  # Download multiple symbols from Binance
   python download_data.py --symbol BTCUSDT ETHUSDT ADAUSDT --days 3 --start 2024-01-15
-
-  # Download all low-funding-rate coins for 7 days
-  python download_data.py --preset low-funding --days 7 --start 2024-01-15
 
   # Download entire months (smaller Binance monthly files)
   python download_data.py --symbol BTCUSDT --months 2024-01 2024-02
-
-  # Download DeFi coins for 30 days
-  python download_data.py --preset defi --days 30 --start 2024-01-01
 """
 
 import argparse
+import csv
+import gzip
+import io
 import logging
 import sys
 import time
+import zipfile
 from pathlib import Path
-from typing import Tuple
+from typing import List, Tuple
 import urllib.request
 import urllib.error
 
@@ -92,12 +94,19 @@ ALTCOIN_SCALP = [
     "ETCUSDT",    # Ethereum Classic
 ]
 
+# Bybit live trader watchlist — matches _WATCHLIST in bybit_trader.py
+BYBIT_WATCHLIST = [
+    "SOLUSDT", "BTCUSDT", "ETHUSDT", "LINKUSDT",
+    "ADAUSDT", "DOGEUSDT", "LTCUSDT",
+]
+
 PRESETS = {
     "low-funding": LOW_FUNDING_COINS,
     "top5": TOP5_COINS,
     "defi": DEFI_COINS,
     "layer1": LAYER1_COINS,
     "altcoin": ALTCOIN_SCALP,
+    "watchlist": BYBIT_WATCHLIST,   # Bybit live trader symbols
 }
 
 
@@ -167,10 +176,80 @@ def parse_month(s: str) -> Tuple[int, int]:
     return int(parts[0]), int(parts[1])
 
 
+# ── Bybit public data download ────────────────────────────────────────────────
+# Bybit hosts trade data at https://public.bybit.com/trading/{symbol}/{symbol}{YYYY-MM-DD}.csv.gz
+# Format: timestamp(ns), symbol, side, size, price, tickDirection, trdMatchID, grossValue, homeNotional, foreignNotional
+
+BYBIT_BASE_URL = "https://public.bybit.com/trading"
+
+
+def download_bybit_day(symbol: str, year: int, month: int, day: int,
+                       output: Path) -> int:
+    """Download one day of Bybit trade data. Returns bytes downloaded."""
+    date_str = f"{year:04d}-{month:02d}-{day:02d}"
+    filename  = f"{symbol}{date_str}.csv.gz"
+    url       = f"{BYBIT_BASE_URL}/{symbol}/{filename}"
+    out_path  = output / f"{symbol}-trades-{date_str}.csv.gz"
+
+    if out_path.exists():
+        logger.debug("  [skip] %s (already exists)", out_path.name)
+        return 0  # 0 = skipped
+
+    nbytes = download_file(url, out_path)
+    return nbytes
+
+
+def load_bybit_csv_gz(path: Path) -> List[Tuple[float, float, float]]:
+    """Load Bybit trade data. Returns list of (timestamp_ms, price, qty)."""
+    rows = []
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                ts_ms = float(row["timestamp"]) / 1e6  # ns → ms
+                price = float(row["price"])
+                size  = float(row["size"])
+                rows.append((ts_ms, price, size))
+            except (KeyError, ValueError):
+                pass
+    return rows
+
+
+def convert_bybit_to_binance_format(bybit_path: Path, out_path: Path) -> int:
+    """Convert Bybit .csv.gz to Binance aggTrades zip so existing code works.
+
+    Output columns: agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,is_buyer_maker
+    """
+    rows = load_bybit_csv_gz(bybit_path)
+    if not rows:
+        return 0
+
+    csv_rows = []
+    for i, (ts_ms, price, qty) in enumerate(rows):
+        csv_rows.append([i, price, qty, i, i, int(ts_ms), "False"])
+
+    # Write CSV inside zip
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["agg_trade_id", "price", "quantity",
+                "first_trade_id", "last_trade_id", "transact_time", "is_buyer_maker"])
+    w.writerows(csv_rows)
+
+    date_part = bybit_path.stem  # e.g. BTCUSDT2024-01-15
+    # Extract symbol and date from filename like SOLUSDT2024-01-15
+    stem = bybit_path.stem  # SOLUSDT2024-01-15 (no .csv)
+    inner_name = stem + ".csv"
+
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(inner_name, buf.getvalue())
+
+    return len(csv_rows)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="download_data",
-        description="Download Binance aggTrades data for HFT backtesting",
+        description="Download aggTrades data for HFT backtesting (Binance or Bybit)",
     )
     parser.add_argument("--symbol", nargs="+", default=[],
                         help="Trading symbols (e.g., BTCUSDT ETHUSDT ADAUSDT)")
@@ -185,6 +264,8 @@ def main() -> None:
                         help="Output directory for downloaded files")
     parser.add_argument("--list-presets", action="store_true",
                         help="Show all available presets and their coins")
+    parser.add_argument("--source", default="binance", choices=["binance", "bybit"],
+                        help="Data source: binance (futures) or bybit (spot). Default: binance")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
@@ -213,6 +294,62 @@ def main() -> None:
     downloaded = 0
     failed = 0
 
+    # ── Bybit download mode ───────────────────────────────────────────────────
+    if args.source == "bybit":
+        if args.start:
+            start_date = parse_date(args.start)
+        else:
+            days_ago   = int(time.time()) - args.days * 86400
+            start_date = unix_to_ymd(days_ago)
+
+        bybit_dir = output / "bybit_raw"
+        bybit_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info("Bybit source: downloading %d symbol(s) x %d day(s)",
+                    len(symbols), args.days)
+        logger.info("Start date  : %04d-%02d-%02d", *start_date)
+
+        for symbol in symbols:
+            for day_offset in range(args.days):
+                year, month, day_num = advance_date(start_date, day_offset)
+                date_str  = f"{year:04d}-{month:02d}-{day_num:02d}"
+                gz_path   = bybit_dir / f"{symbol}-trades-{date_str}.csv.gz"
+                zip_path  = output / f"{symbol}-aggTrades-{date_str}.zip"
+
+                # Skip if final zip already exists
+                if zip_path.exists():
+                    logger.debug("  [skip] %s", zip_path.name)
+                    downloaded += 1
+                    continue
+
+                logger.info("  Downloading %s %s ...", symbol, date_str)
+                try:
+                    nbytes = download_bybit_day(symbol, year, month, day_num, bybit_dir)
+                    if nbytes == 0 and gz_path.exists():
+                        pass  # was already cached
+                    elif nbytes > 0:
+                        logger.info("    Raw: %.1f MB", nbytes / 1_048_576)
+                    # Convert to Binance-compatible zip
+                    n_rows = convert_bybit_to_binance_format(gz_path, zip_path)
+                    if n_rows > 0:
+                        logger.info("    Converted: %d trades → %s", n_rows, zip_path.name)
+                        downloaded += 1
+                    else:
+                        logger.warning("    Empty or failed conversion for %s", gz_path.name)
+                        failed += 1
+                except Exception as e:
+                    logger.error("  FAILED %s %s: %s", symbol, date_str, e)
+                    failed += 1
+                    for p in [gz_path, zip_path]:
+                        if p.exists() and p.stat().st_size == 0:
+                            p.unlink()
+
+        logger.info("Bybit download complete: %d files, %d failed", downloaded, failed)
+        logger.info("Files saved to: %s", output)
+        logger.info("To run backtest: python run_signal_backtest.py --data-dir %s", output)
+        return
+
+    # ── Binance download mode (original) ─────────────────────────────────────
     # Monthly download mode
     if args.months:
         base_url = "https://data.binance.vision/data/futures/um/monthly/aggTrades"
