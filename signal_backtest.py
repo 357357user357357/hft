@@ -26,6 +26,8 @@ import time
 
 from instrument_index import InstrumentIndexer, InstrumentScorecard
 from regime_detector import RegimeDetector, MarketRegime
+from slippage import SlippageModel, SlippageConfig
+from hft_types import Side
 
 
 @dataclass
@@ -51,6 +53,11 @@ class SignalConfig:
     # 5× speedup with negligible accuracy loss since regime doesn't change
     # bar-by-bar.  Fast signals (hurst, momentum) default stride=1.
     signal_stride: int = 1
+
+    # Slippage: realistic fill simulation (default: 1bp fixed + 0.5bp random)
+    slippage_fixed_bps: float = 1.0
+    slippage_random_bps: float = 0.5
+    slippage_enabled: bool = True
 
 
 @dataclass
@@ -167,6 +174,11 @@ class SignalBacktest:
         self._indexer = InstrumentIndexer()
         self._detector = RegimeDetector()
         self._stats = SignalStats()
+        self._slippage = SlippageModel(SlippageConfig(
+            fixed_bps=config.slippage_fixed_bps,
+            random_bps=config.slippage_random_bps,
+            enabled=config.slippage_enabled,
+        ))
 
     def run(self, prices: List[float], volumes: Optional[List[float]] = None) -> SignalStats:
         """Run signal backtest."""
@@ -214,7 +226,9 @@ class SignalBacktest:
                     should_exit = True
 
                 if should_exit:
-                    exit_price = prices[i]
+                    # Apply slippage: exit long = Sell, exit short = Buy
+                    exit_side = Side.Sell if position_side == "long" else Side.Buy
+                    exit_price = self._slippage.apply(prices[i], exit_side)
                     if position_side == "long":
                         pnl = (exit_price - entry_price) / entry_price * 100
                     else:
@@ -242,14 +256,14 @@ class SignalBacktest:
                     in_position = True
                     position_side = "long"
                     entry_bar = i
-                    entry_price = prices[i]
+                    entry_price = self._slippage.apply(prices[i], Side.Buy)
                     entry_score = score
 
                 elif score < -self.config.threshold and self.config.allow_short:
                     in_position = True
                     position_side = "short"
                     entry_bar = i
-                    entry_price = prices[i]
+                    entry_price = self._slippage.apply(prices[i], Side.Sell)
                     entry_score = score
 
         self._stats.compute_metrics()

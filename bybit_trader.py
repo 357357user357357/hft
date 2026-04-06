@@ -177,10 +177,10 @@ class BybitClient:
             raise RuntimeError(f"price error: {r}")
         return float(r["result"]["list"][0]["lastPrice"])
 
-    def get_instrument_info(self, symbol: str) -> dict:
+    def get_instrument_info(self, symbol: str, category: str = "spot") -> dict:
         """Get lot size / min order qty / tick size for a symbol."""
         r = self.get("/v5/market/instruments-info",
-                     {"category": "spot", "symbol": symbol})
+                     {"category": category, "symbol": symbol})
         if r.get("retCode") != 0:
             raise RuntimeError(f"instrument error: {r}")
         return r["result"]["list"][0]
@@ -193,10 +193,11 @@ class BybitClient:
         order_type: str = "Market",   # "Market" or "Limit"
         price:     Optional[str] = None,
         time_in_force: str = "IOC",   # IOC for market-like fills
+        category:  str = "spot",      # "spot" or "linear" (perpetuals)
     ) -> dict:
-        """Place a Spot order. Returns full Bybit response."""
+        """Place an order. Returns full Bybit response."""
         body: Dict = {
-            "category":    "spot",
+            "category":    category,
             "symbol":      symbol,
             "side":        side,
             "orderType":   order_type,
@@ -207,10 +208,10 @@ class BybitClient:
             body["price"] = price
         return self.post("/v5/order/create", body)
 
-    def cancel_all_orders(self, symbol: str) -> dict:
-        """Cancel all open Spot orders for a symbol."""
+    def cancel_all_orders(self, symbol: str, category: str = "spot") -> dict:
+        """Cancel all open orders for a symbol."""
         return self.post("/v5/order/cancel-all",
-                         {"category": "spot", "symbol": symbol})
+                         {"category": category, "symbol": symbol})
 
 
 # ── Order quantity formatter ──────────────────────────────────────────────────
@@ -276,6 +277,41 @@ def _pnl_col(v: float) -> str:
 
 def _clear() -> None:
     print("\033[2J\033[H", end="", flush=True)
+
+
+# ── Kelly position sizing ────────────────────────────────────────────────────
+
+_kelly_sizer = None
+
+def _get_kelly_size(max_usdt: float, equity: float) -> float:
+    """Return Kelly-optimal position size in USDT, reading trade history from CSV.
+    Falls back to max_usdt if not enough history."""
+    global _kelly_sizer
+    if _kelly_sizer is None:
+        from risk_management import PositionSizer, SizingConfig
+        _kelly_sizer = PositionSizer(SizingConfig(
+            mode='kelly', kelly_cap=0.25, kelly_lookback=50,
+            initial_equity=equity, fractional_pct=5.0,
+        ))
+
+    _kelly_sizer.current_equity = equity
+    # Load trade PnL history from trades.csv
+    trade_pnls: List[float] = []
+    if os.path.exists(_TRADE_LOG):
+        import csv
+        try:
+            with open(_TRADE_LOG) as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row.get("side") == "Sell":  # exit trades have PnL
+                        try:
+                            trade_pnls.append(float(row["pnl_pct"]))
+                        except (ValueError, KeyError):
+                            pass
+        except Exception:
+            pass
+    size = _kelly_sizer.calculate_size(trade_pnls)
+    return min(size, max_usdt)  # never exceed max_usdt cap
 
 
 # ── Trade journal (CSV append) ───────────────────────────────────────────────
@@ -356,12 +392,16 @@ def _render(states: List["LiveState"], live_mode: bool, client: Optional[BybitCl
                        f" {_pnl_col(unreal)}{unreal:+.2f}%{_RESET} {_DIM}{held}s{_RESET}")
         elif not st.in_position:
             pos_str = f"  {_DIM}flat{_RESET}"
-        # Spread annotation
+        # Spread + regime annotation
         spread_str = ""
         if sym_ctxs:
             sc = sym_ctxs.get(st.symbol)
             if sc and sc.spread_bps > 0:
                 spread_str = f"  {_DIM}sp={sc.spread_bps:.1f}bp{_RESET}"
+            if sc and len(sc.price_buf) >= 50:
+                regime = _detect_regime_fast(sc.price_buf)
+                r_tag = {"mean-reversion": "MR", "trending": "TR", "neutral": "NT"}
+                spread_str += f"  {_DIM}{r_tag.get(regime, '?')}{_RESET}"
         # CPU analytics annotation
         cpu_str = ""
         if cpu_signals:
@@ -392,6 +432,29 @@ def _corr_group(symbol: str) -> Optional[int]:
         if symbol in g:
             return i
     return None
+
+
+# ── Regime detection (lightweight, from price returns) ───────────────────────
+
+def _detect_regime_fast(prices: List[float]) -> str:
+    """Fast regime detection from lag-1 autocorrelation of returns.
+    Returns 'mean-reversion', 'trending', or 'neutral'."""
+    n = len(prices)
+    if n < 50:
+        return "neutral"
+    rets = [prices[i] - prices[i-1] for i in range(max(1, n-100), n)]
+    nr = len(rets)
+    if nr < 10:
+        return "neutral"
+    mean_r = sum(rets) / nr
+    lag1_cov = sum((rets[i] - mean_r) * (rets[i-1] - mean_r) for i in range(1, nr))
+    var_r = sum((r - mean_r)**2 for r in rets)
+    autocorr = lag1_cov / var_r if var_r > 0 else 0.0
+    if autocorr < -0.05:
+        return "mean-reversion"
+    elif autocorr > 0.05:
+        return "trending"
+    return "neutral"
 
 
 # ── Signal decision (simple threshold on best backtest signal) ────────────────
@@ -493,6 +556,7 @@ class WsOrderClient:
         side:    str,   # "Buy" or "Sell"
         qty:     str,
         timeout: float = 3.0,
+        category: str = "spot",
     ) -> dict:
         """Place a market order via WS. Returns response dict."""
         if not self._ready or self._ws is None:
@@ -509,7 +573,7 @@ class WsOrderClient:
             },
             "op": "order.create",
             "args": [{
-                "category":    "spot",
+                "category":    category,
                 "symbol":      symbol,
                 "side":        side,
                 "orderType":   "Market",
@@ -539,14 +603,14 @@ class WsOrderClient:
 # ── Pre-fill price buffers from REST klines ──────────────────────────────────
 
 def _fetch_recent_klines(client: Optional["BybitClient"], symbol: str,
-                         limit: int = 100) -> Tuple[List[float], List[float]]:
+                         limit: int = 100, category: str = "spot") -> Tuple[List[float], List[float]]:
     """Fetch recent 1-minute klines to seed price/volume buffers on startup.
     Returns (prices, volumes). Falls back to empty lists on error."""
     if client is None:
         return [], []
     try:
         r = client.get("/v5/market/kline",
-                       {"category": "spot", "symbol": symbol,
+                       {"category": category, "symbol": symbol,
                         "interval": "1", "limit": str(limit)})
         if r.get("retCode") != 0:
             return [], []
@@ -578,6 +642,7 @@ class SymbolCtx:
 
 def _cpu_analyze_symbol(sym: str, prices: List[float], volumes: List[float]) -> Dict[str, float]:
     """Heavy CPU analytics for one symbol — runs in a separate process.
+    Uses Rust extension (analytics_rs) when available for ~50x speedup.
 
     Designed to keep a CPU core busy for ~100-200ms per call so that
     continuously resubmitting work results in visible CPU load (~60%+ per core).
@@ -592,6 +657,13 @@ def _cpu_analyze_symbol(sym: str, prices: List[float], volumes: List[float]) -> 
 
     Called in ProcessPoolExecutor — one process per symbol.
     """
+    # Fast path: Rust extension (~2ms vs ~110ms Python)
+    try:
+        import analytics_rs
+        return analytics_rs.analyze_symbol(prices)
+    except ImportError:
+        pass
+
     import math, random
 
     result: Dict[str, float] = {"hurst": 0.5, "ofi": 0.5,
@@ -1072,11 +1144,12 @@ class GpuAnalytics:
 # ── Dynamic watchlist by 24h volume ──────────────────────────────────────────
 
 def _top_symbols_by_volume(client: "BybitClient", n: int = 7,
-                           candidates: Optional[List[str]] = None) -> List[str]:
-    """Rank spot symbols by 24h turnover, return top N.
+                           candidates: Optional[List[str]] = None,
+                           category: str = "spot") -> List[str]:
+    """Rank symbols by 24h turnover, return top N.
     If candidates is given, only rank those; otherwise use all USDT pairs."""
     try:
-        r = client.get("/v5/market/tickers", {"category": "spot"})
+        r = client.get("/v5/market/tickers", {"category": category})
         if r.get("retCode") != 0:
             return candidates or []
         tickers = r["result"]["list"]
@@ -1114,9 +1187,12 @@ async def _trading_loop(
     display_interval: float,
     client:      Optional[BybitClient],
     close_on_exit: bool = False,
+    use_perps: bool = False,
 ) -> None:
     """Multi-symbol loop: one WebSocket, all coins, signal per coin."""
     import websockets
+
+    _cat = "linear" if use_perps else "spot"   # Bybit category
 
     # Build per-symbol context
     ctxs: Dict[str, SymbolCtx] = {}
@@ -1126,14 +1202,15 @@ async def _trading_loop(
         ctx = SymbolCtx(st=st)
         if client:
             try:
-                info = client.get_instrument_info(sym)
+                info = client.get_instrument_info(sym, category=_cat)
                 lf = info.get("lotSizeFilter", {})
-                ctx.lot_step = float(lf.get("basePrecision", "0.0001"))
+                qty_key = "basePrecision" if _cat == "spot" else "qtyStep"
+                ctx.lot_step = float(lf.get(qty_key, "0.0001"))
                 ctx.min_qty  = float(lf.get("minOrderQty",   "0.0001"))
             except Exception:
                 pass
             # Pre-fill buffers from recent klines — start trading immediately
-            kp, kv = _fetch_recent_klines(client, sym, limit=100)
+            kp, kv = _fetch_recent_klines(client, sym, limit=100, category=_cat)
             if kp:
                 ctx.price_buf  = kp
                 ctx.volume_buf = kv
@@ -1176,7 +1253,8 @@ async def _trading_loop(
             print(f"{_YELLOW}  WS orders : failed ({e}), falling back to REST{_RESET}")
             ws_orders = None
 
-    ws_url = "wss://stream.bybit.com/v5/public/spot"
+    ws_url = ("wss://stream.bybit.com/v5/public/linear" if use_perps
+               else "wss://stream.bybit.com/v5/public/spot")
 
     async def _ws_loop() -> None:
         trade_args = [f"publicTrade.{s}" for s in symbols]
@@ -1265,11 +1343,25 @@ async def _trading_loop(
                     if unreal > st.peak_pnl:
                         st.peak_pnl = unreal
 
-                    # ── Exit conditions ──────────────────────────────────
-                    TRAIL_ACTIVATE = 0.15   # start trailing after 0.15% profit
-                    TRAIL_DISTANCE = 0.25   # exit if retraced 0.25% from peak
-                    HARD_STOP      = -0.8   # hard stop-loss %
-                    MAX_HOLD_SEC   = 300    # exit stale positions after 5 min
+                    # ── Regime-adaptive exit conditions ──────────────────
+                    regime = _detect_regime_fast(ctx.price_buf)
+                    if regime == "trending":
+                        # Trending: let profits run, wider stops
+                        TRAIL_ACTIVATE = 0.25
+                        TRAIL_DISTANCE = 0.40
+                        HARD_STOP      = -1.2
+                        MAX_HOLD_SEC   = 600
+                    elif regime == "mean-reversion":
+                        # Mean-reversion: quick profits, tight stops
+                        TRAIL_ACTIVATE = 0.10
+                        TRAIL_DISTANCE = 0.15
+                        HARD_STOP      = -0.5
+                        MAX_HOLD_SEC   = 180
+                    else:
+                        TRAIL_ACTIVATE = 0.15
+                        TRAIL_DISTANCE = 0.25
+                        HARD_STOP      = -0.8
+                        MAX_HOLD_SEC   = 300
                     held_sec = time.monotonic() - st.entry_time
 
                     exit_trade = False
@@ -1292,13 +1384,13 @@ async def _trading_loop(
                             try:
                                 if ws_orders:
                                     t0 = time.monotonic()
-                                    resp = await ws_orders.place_order(sym, side, qty_str)
+                                    resp = await ws_orders.place_order(sym, side, qty_str, category=_cat)
                                     ms = (time.monotonic()-t0)*1000
                                     status = f"WS {resp.get('retMsg','?')} {ms:.0f}ms"
                                 else:
                                     loop = asyncio.get_event_loop()
                                     resp = await loop.run_in_executor(
-                                        None, lambda: client.place_order(sym, side, qty_str))
+                                        None, lambda: client.place_order(sym, side, qty_str, category=_cat))
                                     status = f"REST {resp.get('retMsg','?')}"
                             except Exception as e:
                                 status = f"ERROR: {e}"
@@ -1366,29 +1458,37 @@ async def _trading_loop(
 
                 # Hurst < 0.55 = not strongly trending (good for mean-reversion)
                 # OFI > 0.45 = buy pressure confirms long entry
-                hurst_ok   = hurst < 0.55
-                enter_long = gap > thr and zscore > -1.5 and hurst_ok and ofi > 0.45
+                hurst_ok    = hurst < 0.55
+                enter_long  = gap > thr and zscore > -1.5 and hurst_ok and ofi > 0.45
+                enter_short = (use_perps and gap < -thr and zscore < 1.5
+                               and hurst_ok and ofi < 0.55)
 
-                # Spot trading: long-only (can't short on Bybit Spot)
-                if not enter_long:
+                if not enter_long and not enter_short:
                     continue
 
                 # Backtest signal gate — best signal per symbol (Order Flow, Simons, etc.)
                 if use_signals:
                     score = _get_signal_score(sym, list(ctx.price_buf), list(ctx.volume_buf))
-                    if score < signal_threshold:
+                    if enter_long and score < signal_threshold:
+                        continue
+                    if enter_short and score > -signal_threshold:
                         continue
 
-                raw_qty = max_usdt / price
+                # Kelly-optimal sizing (capped at max_usdt)
+                order_usdt = _get_kelly_size(max_usdt, equity)
+                raw_qty = order_usdt / price
                 qty_str = _format_qty(raw_qty, ctx.lot_step)
                 if float(qty_str) < ctx.min_qty:
                     continue
 
-                side = "Buy"
+                side = "Buy" if enter_long else "Sell"
                 # Paper mode: simulate slippage (half-spread + 1bp market impact)
                 if not live_mode:
                     slip_bps = max(ctx.spread_bps / 2, 1.0) + 1.0  # half-spread + 1bp
-                    price = price * (1 + slip_bps / 10000)   # buy at worse price
+                    if enter_long:
+                        price = price * (1 + slip_bps / 10000)
+                    else:
+                        price = price * (1 - slip_bps / 10000)
                 if live_mode and client:
                     try:
                         # Use cached balance (refreshed every 30s by dashboard)
@@ -1396,13 +1496,13 @@ async def _trading_loop(
                             continue
                         if ws_orders:
                             t0 = time.monotonic()
-                            resp = await ws_orders.place_order(sym, side, qty_str)
+                            resp = await ws_orders.place_order(sym, side, qty_str, category=_cat)
                             ms = (time.monotonic()-t0)*1000
                             status   = f"WS {resp.get('retMsg','?')} {ms:.0f}ms"
                             order_id = (resp.get("data") or {}).get("orderId", "?")
                         else:
                             resp = await loop.run_in_executor(
-                                None, lambda: client.place_order(sym, side, qty_str))
+                                None, lambda: client.place_order(sym, side, qty_str, category=_cat))
                             status   = f"REST {resp.get('retMsg','?')}"
                             order_id = resp.get("result", {}).get("orderId", "?")
                     except Exception as e:
@@ -1411,7 +1511,7 @@ async def _trading_loop(
                     status = "paper"; order_id = "sim"
 
                 st.in_position   = True
-                st.position_side = "long"
+                st.position_side = "long" if enter_long else "short"
                 st.entry_price   = price
                 st.entry_qty     = float(qty_str)
                 st.entry_time    = time.monotonic()
@@ -1505,7 +1605,7 @@ async def _trading_loop(
                     side = "Sell" if st.position_side == "long" else "Buy"
                     qty_str = _format_qty(st.entry_qty, ctx.lot_step)
                     try:
-                        client.place_order(sym, side, qty_str)
+                        client.place_order(sym, side, qty_str, category=_cat)
                         unreal = (st.price - st.entry_price) / st.entry_price * 100
                         held = time.monotonic() - st.entry_time
                         _log_trade(sym, side, qty_str, st.price, unreal,
@@ -1546,6 +1646,8 @@ def main() -> None:
                         help="Flatten all open positions on Ctrl+C")
     parser.add_argument("--auto-symbols", type=int, default=0, metavar="N",
                         help="Pick top N symbols by 24h volume (0=disabled)")
+    parser.add_argument("--perps", action="store_true",
+                        help="Use linear perpetuals (enables shorting + leverage)")
     args = parser.parse_args()
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -1571,8 +1673,9 @@ def main() -> None:
             print(f"  Funding : {fund_bal:.4f} USDT")
             print(f"  Total   : {bal + fund_bal:.4f} USDT")
             # Dynamic watchlist: rank by 24h volume
+            _mkt_cat = "linear" if args.perps else "spot"
             if auto_n > 0:
-                symbols = _top_symbols_by_volume(client, auto_n, symbols)
+                symbols = _top_symbols_by_volume(client, auto_n, symbols, category=_mkt_cat)
                 print(f"  Auto-ranked top {auto_n} by 24h volume")
             print(f"  Watching: {', '.join(symbols)}")
             # Test WS order auth in a subprocess (avoids asyncio.run conflict)
@@ -1603,8 +1706,9 @@ def main() -> None:
         print(f"{_YELLOW}Paper mode — no real orders will be placed{_RESET}")
         if api_key:
             client = BybitClient(api_key, api_secret, testnet)
+            _mkt_cat = "linear" if args.perps else "spot"
             if auto_n > 0:
-                symbols = _top_symbols_by_volume(client, auto_n, symbols)
+                symbols = _top_symbols_by_volume(client, auto_n, symbols, category=_mkt_cat)
                 print(f"  Auto-ranked top {auto_n} by 24h volume")
         print(f"  Watching: {', '.join(symbols)}")
         print(f"  Equity  : {args.equity} USDT  (simulated)")
@@ -1623,6 +1727,7 @@ def main() -> None:
             display_interval = args.display,
             client           = client,
             close_on_exit    = args.close_on_exit,
+            use_perps        = args.perps,
         ))
     except KeyboardInterrupt:
         print("\nStopped.")
