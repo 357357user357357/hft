@@ -245,6 +245,7 @@ class LiveState:
     entry_price:  float = 0.0
     entry_qty:    float = 0.0
     entry_time:   float = field(default_factory=time.monotonic)
+    peak_pnl:    float = 0.0     # highest unrealized PnL % (trailing stop)
 
     # Stats
     total_trades: int   = 0
@@ -276,6 +277,10 @@ def _clear() -> None:
     print("\033[2J\033[H", end="", flush=True)
 
 
+# ── Balance cache (avoid hammering API every dashboard refresh) ───────────────
+_bal_cache:    float = 0.0
+_bal_cache_ts: float = 0.0
+
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 
 def _render(states: List["LiveState"], live_mode: bool, client: Optional[BybitClient],
@@ -286,11 +291,16 @@ def _render(states: List["LiveState"], live_mode: bool, client: Optional[BybitCl
     mode_str = f"{_RED}{_BOLD}LIVE ORDERS{_RESET}" if live_mode else f"{_YELLOW}PAPER MODE{_RESET}"
     bal_str = ""
     if client:
-        try:
-            bal = client.get_balance("USDT")
-            bal_str = f"  wallet={_CYAN}{bal:.4f} USDT{_RESET}"
-        except Exception:
-            bal_str = ""
+        global _bal_cache, _bal_cache_ts
+        now = time.monotonic()
+        if now - _bal_cache_ts > 30.0:   # refresh every 30s, not every 1s
+            try:
+                _bal_cache = client.get_balance("USDT")
+                _bal_cache_ts = now
+            except Exception:
+                pass
+        if _bal_cache > 0:
+            bal_str = f"  wallet={_CYAN}{_bal_cache:.4f} USDT{_RESET}"
 
     win_rate = winning / total_trades * 100 if total_trades > 0 else 0.0
     print(f"{_BOLD}{'─'*70}{_RESET}")
@@ -341,23 +351,27 @@ def _render(states: List["LiveState"], live_mode: bool, client: Optional[BybitCl
 
 # ── Signal decision (simple threshold on best backtest signal) ────────────────
 
+_BEST_SIGNAL: Dict[str, str] = {
+    "SOLUSDT":  "volatility",
+    "LTCUSDT":  "polar",
+    "LINKUSDT": "order_flow",
+    "BTCUSDT":  "order_flow",
+    "ETHUSDT":  "order_flow",
+    "MATICUSDT": "hurst",
+    "ADAUSDT":  "poincare",
+    "DOGEUSDT": "poincare",
+}
+_indexer_instance = None
+
 def _get_signal_score(symbol: str, prices: List[float], volumes: List[float]) -> float:
     """Compute signal score using best backtest signal for this symbol."""
-    _BEST: Dict[str, str] = {
-        "SOLUSDT":  "volatility",
-        "LTCUSDT":  "polar",
-        "LINKUSDT": "order_flow",
-        "BTCUSDT":  "order_flow",
-        "ETHUSDT":  "order_flow",
-        "MATICUSDT": "hurst",
-        "ADAUSDT":  "poincare",
-        "DOGEUSDT": "poincare",
-    }
-    sig = _BEST.get(symbol, "volatility")
+    global _indexer_instance
+    sig = _BEST_SIGNAL.get(symbol, "volatility")
     try:
-        from instrument_index import InstrumentIndexer
-        idx = InstrumentIndexer()
-        return idx.compute_signal(sig, prices, volumes)
+        if _indexer_instance is None:
+            from instrument_index import InstrumentIndexer
+            _indexer_instance = InstrumentIndexer()
+        return _indexer_instance.compute_signal(sig, prices, volumes, symbol)
     except Exception:
         return 0.0
 
@@ -446,7 +460,7 @@ class WsOrderClient:
             "reqId": req_id,
             "header": {
                 "X-BAPI-TIMESTAMP":   ts,
-                "X-BAPI-RECV-WINDOW": "5000",
+                "X-BAPI-RECV-WINDOW": "10000",
             },
             "op": "order.create",
             "args": [{
@@ -1063,9 +1077,11 @@ async def _trading_loop(
 
     async def _ws_loop() -> None:
         args = [f"publicTrade.{s}" for s in symbols]
+        backoff = 1.0   # exponential backoff: 1s → 2s → 4s → … → 30s max
         async for ws in websockets.connect(ws_url, ping_interval=20):
             try:
                 await ws.send(json.dumps({"op": "subscribe", "args": args}))
+                backoff = 1.0   # reset on successful connection
                 async for raw in ws:
                     msg = json.loads(raw)
                     topic = msg.get("topic", "")
@@ -1086,10 +1102,12 @@ async def _trading_loop(
                             ctx.price_buf  = ctx.price_buf[-_MA_SLOW * 4:]
                             ctx.volume_buf = ctx.volume_buf[-_MA_SLOW * 4:]
             except websockets.ConnectionClosed:
-                await asyncio.sleep(1)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
             except Exception as e:
                 print(f"WS error: {e}")
-                await asyncio.sleep(2)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
 
     async def _signal_loop() -> None:
         nonlocal daily_pnl, total_trades, winning
@@ -1117,7 +1135,26 @@ async def _trading_loop(
                     if st.position_side == "short":
                         unreal = -unreal
 
-                    if unreal >= 0.5 or unreal <= -0.8:
+                    # Track peak unrealized PnL for trailing stop
+                    if unreal > st.peak_pnl:
+                        st.peak_pnl = unreal
+
+                    # ── Exit conditions ──────────────────────────────────
+                    TRAIL_ACTIVATE = 0.15   # start trailing after 0.15% profit
+                    TRAIL_DISTANCE = 0.25   # exit if retraced 0.25% from peak
+                    HARD_STOP      = -0.8   # hard stop-loss %
+                    MAX_HOLD_SEC   = 300    # exit stale positions after 5 min
+                    held_sec = time.monotonic() - st.entry_time
+
+                    exit_trade = False
+                    if unreal <= HARD_STOP:
+                        exit_trade = True                      # hard stop-loss
+                    elif st.peak_pnl >= TRAIL_ACTIVATE and unreal <= st.peak_pnl - TRAIL_DISTANCE:
+                        exit_trade = True                      # trailing stop
+                    elif held_sec > MAX_HOLD_SEC and unreal < 0.1:
+                        exit_trade = True                      # stale timeout
+
+                    if exit_trade:
                         side = "Sell" if st.position_side == "long" else "Buy"
                         qty_str = _format_qty(st.entry_qty, ctx.lot_step)
                         if live_mode and client:
@@ -1152,9 +1189,9 @@ async def _trading_loop(
                         st.position_side = ""
                     continue
 
-                # ── Entry — only one open position across all symbols ─────────
-                any_open = any(c.st.in_position for c in ctxs.values())
-                if any_open:
+                # ── Entry — allow concurrent positions (max 3 symbols at once) ──
+                open_count = sum(1 for c in ctxs.values() if c.st.in_position)
+                if open_count >= 3:
                     continue
 
                 # Read GPU analytics result (computed in background thread)
@@ -1174,21 +1211,27 @@ async def _trading_loop(
                 hurst   = cpu_sig.get("hurst", 0.5)
                 ofi     = cpu_sig.get("ofi", 0.5)   # >0.5 = buy pressure
 
-                # Hurst < 0.45 = strong mean-reversion (good for our strategy)
-                # OFI confirms direction
-                hurst_ok = hurst < 0.55   # not trending away from us
-                enter_long  = gap >  thr and zscore > -1.5 and hurst_ok and ofi > 0.45
-                enter_short = gap < -thr and zscore <  1.5 and hurst_ok and ofi < 0.55
+                # Hurst < 0.55 = not strongly trending (good for mean-reversion)
+                # OFI > 0.45 = buy pressure confirms long entry
+                hurst_ok   = hurst < 0.55
+                enter_long = gap > thr and zscore > -1.5 and hurst_ok and ofi > 0.45
 
-                if not (enter_long or enter_short):
+                # Spot trading: long-only (can't short on Bybit Spot)
+                if not enter_long:
                     continue
+
+                # Backtest signal gate — best signal per symbol (Order Flow, Simons, etc.)
+                if use_signals:
+                    score = _get_signal_score(sym, list(ctx.price_buf), list(ctx.volume_buf))
+                    if score < signal_threshold:
+                        continue
 
                 raw_qty = max_usdt / price
                 qty_str = _format_qty(raw_qty, ctx.lot_step)
                 if float(qty_str) < ctx.min_qty:
                     continue
 
-                side = "Buy" if enter_long else "Sell"
+                side = "Buy"
                 if live_mode and client:
                     try:
                         loop = asyncio.get_event_loop()
@@ -1214,10 +1257,11 @@ async def _trading_loop(
                     status = "paper"; order_id = "sim"
 
                 st.in_position   = True
-                st.position_side = "long" if enter_long else "short"
+                st.position_side = "long"
                 st.entry_price   = price
                 st.entry_qty     = float(qty_str)
                 st.entry_time    = time.monotonic()
+                st.peak_pnl      = 0.0
                 st.orders.append({"side": side, "qty": qty_str,
                                   "price": f"{price:.4f}",
                                   "status": status, "orderId": order_id})
