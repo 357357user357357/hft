@@ -246,6 +246,7 @@ class LiveState:
     entry_qty:    float = 0.0
     entry_time:   float = field(default_factory=time.monotonic)
     peak_pnl:    float = 0.0     # highest unrealized PnL % (trailing stop)
+    last_exit_time: float = 0.0  # cooldown: avoid re-entry churn
 
     # Stats
     total_trades: int   = 0
@@ -277,6 +278,25 @@ def _clear() -> None:
     print("\033[2J\033[H", end="", flush=True)
 
 
+# ── Trade journal (CSV append) ───────────────────────────────────────────────
+
+_TRADE_LOG = os.path.join(os.path.dirname(__file__), "trades.csv")
+
+def _log_trade(symbol: str, side: str, qty: str, price: float,
+               pnl_pct: float, status: str, held_sec: float = 0.0) -> None:
+    """Append one row to trades.csv. Creates header if file is new."""
+    import csv
+    write_header = not os.path.exists(_TRADE_LOG)
+    with open(_TRADE_LOG, "a", newline="") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(["timestamp", "symbol", "side", "qty", "price",
+                        "pnl_pct", "held_sec", "status"])
+        w.writerow([datetime.utcnow().isoformat(timespec="seconds"),
+                    symbol, side, qty, f"{price:.6f}",
+                    f"{pnl_pct:+.4f}", f"{held_sec:.0f}", status])
+
+
 # ── Balance cache (avoid hammering API every dashboard refresh) ───────────────
 _bal_cache:    float = 0.0
 _bal_cache_ts: float = 0.0
@@ -286,7 +306,8 @@ _bal_cache_ts: float = 0.0
 def _render(states: List["LiveState"], live_mode: bool, client: Optional[BybitClient],
             equity: float, daily_pnl: float, total_trades: int, winning: int,
             gpu: Optional["GpuAnalytics"] = None,
-            cpu_signals: Optional[Dict[str, Dict[str, float]]] = None) -> None:
+            cpu_signals: Optional[Dict[str, Dict[str, float]]] = None,
+            sym_ctxs: Optional[Dict[str, "SymbolCtx"]] = None) -> None:
     _clear()
     mode_str = f"{_RED}{_BOLD}LIVE ORDERS{_RESET}" if live_mode else f"{_YELLOW}PAPER MODE{_RESET}"
     bal_str = ""
@@ -335,6 +356,12 @@ def _render(states: List["LiveState"], live_mode: bool, client: Optional[BybitCl
                        f" {_pnl_col(unreal)}{unreal:+.2f}%{_RESET} {_DIM}{held}s{_RESET}")
         elif not st.in_position:
             pos_str = f"  {_DIM}flat{_RESET}"
+        # Spread annotation
+        spread_str = ""
+        if sym_ctxs:
+            sc = sym_ctxs.get(st.symbol)
+            if sc and sc.spread_bps > 0:
+                spread_str = f"  {_DIM}sp={sc.spread_bps:.1f}bp{_RESET}"
         # CPU analytics annotation
         cpu_str = ""
         if cpu_signals:
@@ -343,10 +370,28 @@ def _render(states: List["LiveState"], live_mode: bool, client: Optional[BybitCl
                 h = cs.get("hurst", 0.5); o = cs.get("ofi", 0.5)
                 sh = cs.get("sharpe", 0.0)
                 cpu_str = (f"  {_DIM}H={h:.2f} OFI={o:.2f} Sh={sh:+.1f}{_RESET}")
-        print(f"  {st.symbol:<12} {price_str}  {pos_str}{cpu_str}")
+        print(f"  {st.symbol:<12} {price_str}  {pos_str}{spread_str}{cpu_str}")
 
     print(f"\n{_BOLD}{'─'*70}{_RESET}")
     print(f"  {_DIM}Ctrl+C to stop{_RESET}", flush=True)
+
+
+# ── Correlation groups (avoid stacking correlated positions) ─────────────────
+# Symbols in the same group have historically >0.8 correlation.
+# Only one open position allowed per group.
+_CORR_GROUPS: List[set] = [
+    {"BTCUSDT", "ETHUSDT"},          # BTC/ETH move together
+    {"SOLUSDT", "ADAUSDT"},          # alt-L1s
+    {"LINKUSDT", "LTCUSDT"},         # mid-caps
+    {"DOGEUSDT"},                    # meme — uncorrelated
+]
+
+def _corr_group(symbol: str) -> Optional[int]:
+    """Return group index for a symbol, or None if ungrouped."""
+    for i, g in enumerate(_CORR_GROUPS):
+        if symbol in g:
+            return i
+    return None
 
 
 # ── Signal decision (simple threshold on best backtest signal) ────────────────
@@ -491,6 +536,30 @@ class WsOrderClient:
             await self._ws.close()
 
 
+# ── Pre-fill price buffers from REST klines ──────────────────────────────────
+
+def _fetch_recent_klines(client: Optional["BybitClient"], symbol: str,
+                         limit: int = 100) -> Tuple[List[float], List[float]]:
+    """Fetch recent 1-minute klines to seed price/volume buffers on startup.
+    Returns (prices, volumes). Falls back to empty lists on error."""
+    if client is None:
+        return [], []
+    try:
+        r = client.get("/v5/market/kline",
+                       {"category": "spot", "symbol": symbol,
+                        "interval": "1", "limit": str(limit)})
+        if r.get("retCode") != 0:
+            return [], []
+        prices, volumes = [], []
+        # Bybit returns newest first — reverse for chronological order
+        for k in reversed(r["result"]["list"]):
+            prices.append(float(k[4]))   # close price
+            volumes.append(float(k[5]))  # volume
+        return prices, volumes
+    except Exception:
+        return [], []
+
+
 # ── Per-symbol state (lot sizing + price buffers) ─────────────────────────────
 
 @dataclass
@@ -500,6 +569,9 @@ class SymbolCtx:
     min_qty:    float = 0.0001
     price_buf:  List[float] = field(default_factory=list)
     volume_buf: List[float] = field(default_factory=list)
+    best_bid:   float = 0.0   # orderbook top-of-book
+    best_ask:   float = 0.0
+    spread_bps: float = 0.0   # spread in basis points
 
 
 # ── CPU analytics workers (top-level for multiprocessing pickle) ─────────────
@@ -780,12 +852,14 @@ class GpuAnalytics:
             self._bufs[sym] = buf[-self.WIN_VOL * 8:]
 
     def _compute_cpu(self, sym: str, buf: List[float]) -> Dict[str, float]:
-        """Pure-Python fallback — same math as GPU path."""
+        """Pure-Python fallback — uses GPU-optimized windows when available."""
+        fw = self.best_fast_w   # updated by GPU optimizer
+        sw_w = self.best_slow_w
         n = len(buf)
-        if n < self.WIN_FAST + 2:
+        if n < fw + 2:
             return {"gap": 0.0, "zscore": 0.0, "vol": 0.0, "n": float(n)}
-        sw   = min(self.WIN_SLOW, n)
-        fast = sum(buf[-self.WIN_FAST:]) / self.WIN_FAST
+        sw   = min(sw_w, n)
+        fast = sum(buf[-fw:]) / fw
         slow = sum(buf[-sw:]) / sw
         gap  = (fast - slow) / slow if slow else 0.0
         vw   = min(self.WIN_VOL, n)
@@ -995,6 +1069,28 @@ class GpuAnalytics:
                 pass
 
 
+# ── Dynamic watchlist by 24h volume ──────────────────────────────────────────
+
+def _top_symbols_by_volume(client: "BybitClient", n: int = 7,
+                           candidates: Optional[List[str]] = None) -> List[str]:
+    """Rank spot symbols by 24h turnover, return top N.
+    If candidates is given, only rank those; otherwise use all USDT pairs."""
+    try:
+        r = client.get("/v5/market/tickers", {"category": "spot"})
+        if r.get("retCode") != 0:
+            return candidates or []
+        tickers = r["result"]["list"]
+        # Filter to USDT pairs only
+        pairs = [(t["symbol"], float(t.get("turnover24h", 0))) for t in tickers
+                 if t["symbol"].endswith("USDT")]
+        if candidates:
+            pairs = [(s, v) for s, v in pairs if s in candidates]
+        pairs.sort(key=lambda x: x[1], reverse=True)
+        return [s for s, _ in pairs[:n]]
+    except Exception:
+        return candidates or []
+
+
 # ── Main trading loop ─────────────────────────────────────────────────────────
 
 # Watchlist — best backtest signals used for entry direction
@@ -1017,6 +1113,7 @@ async def _trading_loop(
     signal_threshold: float,
     display_interval: float,
     client:      Optional[BybitClient],
+    close_on_exit: bool = False,
 ) -> None:
     """Multi-symbol loop: one WebSocket, all coins, signal per coin."""
     import websockets
@@ -1035,6 +1132,12 @@ async def _trading_loop(
                 ctx.min_qty  = float(lf.get("minOrderQty",   "0.0001"))
             except Exception:
                 pass
+            # Pre-fill buffers from recent klines — start trading immediately
+            kp, kv = _fetch_recent_klines(client, sym, limit=100)
+            if kp:
+                ctx.price_buf  = kp
+                ctx.volume_buf = kv
+                st.price = kp[-1]
         ctxs[sym] = ctx
 
     # Shared portfolio stats
@@ -1076,7 +1179,9 @@ async def _trading_loop(
     ws_url = "wss://stream.bybit.com/v5/public/spot"
 
     async def _ws_loop() -> None:
-        args = [f"publicTrade.{s}" for s in symbols]
+        trade_args = [f"publicTrade.{s}" for s in symbols]
+        book_args  = [f"orderbook.1.{s}" for s in symbols]   # depth=1 (top of book)
+        args = trade_args + book_args
         backoff = 1.0   # exponential backoff: 1s → 2s → 4s → … → 30s max
         async for ws in websockets.connect(ws_url, ping_interval=20):
             try:
@@ -1085,6 +1190,25 @@ async def _trading_loop(
                 async for raw in ws:
                     msg = json.loads(raw)
                     topic = msg.get("topic", "")
+
+                    # ── Orderbook top-of-book → spread tracking ──────────
+                    if topic.startswith("orderbook"):
+                        sym = topic.split(".")[-1]
+                        ctx = ctxs.get(sym)
+                        if ctx is None:
+                            continue
+                        data = msg.get("data", {})
+                        bids = data.get("b", [])
+                        asks = data.get("a", [])
+                        if bids:
+                            ctx.best_bid = float(bids[0][0])
+                        if asks:
+                            ctx.best_ask = float(asks[0][0])
+                        if ctx.best_bid > 0 and ctx.best_ask > 0:
+                            mid = (ctx.best_bid + ctx.best_ask) / 2
+                            ctx.spread_bps = (ctx.best_ask - ctx.best_bid) / mid * 10000
+                        continue
+
                     if not topic.startswith("publicTrade"):
                         continue
                     sym = topic.split(".")[-1]
@@ -1098,9 +1222,11 @@ async def _trading_loop(
                         ctx.price_buf.append(p)
                         ctx.volume_buf.append(v)
                         gpu.update_buf(sym, p)   # feed GPU analytics
-                        if len(ctx.price_buf) > _MA_SLOW * 4:
-                            ctx.price_buf  = ctx.price_buf[-_MA_SLOW * 4:]
-                            ctx.volume_buf = ctx.volume_buf[-_MA_SLOW * 4:]
+                        # Keep enough ticks for GPU-optimized slow window (up to 80)
+                        _max_buf = max(_MA_SLOW, gpu.best_slow_w) * 4
+                        if len(ctx.price_buf) > _max_buf:
+                            ctx.price_buf  = ctx.price_buf[-_max_buf:]
+                            ctx.volume_buf = ctx.volume_buf[-_max_buf:]
             except websockets.ConnectionClosed:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
@@ -1157,6 +1283,11 @@ async def _trading_loop(
                     if exit_trade:
                         side = "Sell" if st.position_side == "long" else "Buy"
                         qty_str = _format_qty(st.entry_qty, ctx.lot_step)
+                        # Paper mode: simulate sell slippage
+                        if not live_mode:
+                            slip_bps = max(ctx.spread_bps / 2, 1.0) + 1.0
+                            price = price * (1 - slip_bps / 10000)  # sell at worse price
+                            unreal = (price - st.entry_price) / st.entry_price * 100
                         if live_mode and client:
                             try:
                                 if ws_orders:
@@ -1185,13 +1316,35 @@ async def _trading_loop(
                                           "price": f"{price:.4f}",
                                           "status": status,
                                           "pnl": f"{unreal:+.3f}%"})
-                        st.in_position   = False
-                        st.position_side = ""
+                        _log_trade(sym, side, qty_str, price, unreal, status, held_sec)
+                        st.in_position    = False
+                        st.position_side  = ""
+                        st.last_exit_time = time.monotonic()
                     continue
 
                 # ── Entry — allow concurrent positions (max 3 symbols at once) ──
                 open_count = sum(1 for c in ctxs.values() if c.st.in_position)
                 if open_count >= 3:
+                    continue
+
+                # Per-symbol cooldown — avoid whipsaw re-entry after exit
+                COOLDOWN_SEC = 45.0
+                if st.last_exit_time > 0 and (time.monotonic() - st.last_exit_time) < COOLDOWN_SEC:
+                    continue
+
+                # Correlation filter — skip if same-group position already open
+                my_group = _corr_group(sym)
+                if my_group is not None:
+                    group_open = any(
+                        c.st.in_position and _corr_group(s) == my_group
+                        for s, c in ctxs.items() if s != sym
+                    )
+                    if group_open:
+                        continue
+
+                # Spread filter — skip when spread is too wide (illiquid)
+                MAX_SPREAD_BPS = 15.0   # 1.5 bps = 0.15%
+                if ctx.spread_bps > MAX_SPREAD_BPS:
                     continue
 
                 # Read GPU analytics result (computed in background thread)
@@ -1232,13 +1385,14 @@ async def _trading_loop(
                     continue
 
                 side = "Buy"
+                # Paper mode: simulate slippage (half-spread + 1bp market impact)
+                if not live_mode:
+                    slip_bps = max(ctx.spread_bps / 2, 1.0) + 1.0  # half-spread + 1bp
+                    price = price * (1 + slip_bps / 10000)   # buy at worse price
                 if live_mode and client:
                     try:
-                        loop = asyncio.get_event_loop()
-                        # Balance check runs in thread pool (non-blocking)
-                        bal = await loop.run_in_executor(
-                            _thread_pool, lambda: client.get_balance("USDT"))
-                        if bal < max_usdt * 0.9:
+                        # Use cached balance (refreshed every 30s by dashboard)
+                        if _bal_cache > 0 and _bal_cache < max_usdt * 0.9:
                             continue
                         if ws_orders:
                             t0 = time.monotonic()
@@ -1265,6 +1419,7 @@ async def _trading_loop(
                 st.orders.append({"side": side, "qty": qty_str,
                                   "price": f"{price:.4f}",
                                   "status": status, "orderId": order_id})
+                _log_trade(sym, side, qty_str, price, 0.0, status)
 
     async def _cpu_analytics_loop() -> None:
         """Keep all CPU cores saturated with analytics work.
@@ -1331,7 +1486,7 @@ async def _trading_loop(
         states = [ctx.st for ctx in ctxs.values()]
         while True:
             _render(states, live_mode, client,
-                    equity, daily_pnl, total_trades, winning, gpu, _cpu_signals)
+                    equity, daily_pnl, total_trades, winning, gpu, _cpu_signals, ctxs)
             await asyncio.sleep(display_interval)
 
     try:
@@ -1342,6 +1497,22 @@ async def _trading_loop(
             asyncio.create_task(_display_loop(),        name="display"),
         )
     finally:
+        # Flatten open positions on exit if requested
+        if close_on_exit and live_mode and client:
+            for sym, ctx in ctxs.items():
+                st = ctx.st
+                if st.in_position and st.entry_qty > 0:
+                    side = "Sell" if st.position_side == "long" else "Buy"
+                    qty_str = _format_qty(st.entry_qty, ctx.lot_step)
+                    try:
+                        client.place_order(sym, side, qty_str)
+                        unreal = (st.price - st.entry_price) / st.entry_price * 100
+                        held = time.monotonic() - st.entry_time
+                        _log_trade(sym, side, qty_str, st.price, unreal,
+                                   "close-on-exit", held)
+                        print(f"  Closed {sym} {side} {qty_str} ({unreal:+.2f}%)")
+                    except Exception as e:
+                        print(f"  Failed to close {sym}: {e}")
         gpu.stop()
         _thread_pool.shutdown(wait=False)
         _cpu_pool.shutdown(wait=False)
@@ -1371,9 +1542,14 @@ def main() -> None:
                         help="Signal entry threshold (default: 0.15)")
     parser.add_argument("--display",   type=float, default=1.0,
                         help="Dashboard refresh seconds (default: 1)")
+    parser.add_argument("--close-on-exit", action="store_true",
+                        help="Flatten all open positions on Ctrl+C")
+    parser.add_argument("--auto-symbols", type=int, default=0, metavar="N",
+                        help="Pick top N symbols by 24h volume (0=disabled)")
     args = parser.parse_args()
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    auto_n  = args.auto_symbols   # 0 = disabled
 
     # Load credentials
     api_key    = os.environ.get("BYBIT_API_KEY",    "")
@@ -1394,6 +1570,10 @@ def main() -> None:
             print(f"  Unified : {bal:.4f} USDT")
             print(f"  Funding : {fund_bal:.4f} USDT")
             print(f"  Total   : {bal + fund_bal:.4f} USDT")
+            # Dynamic watchlist: rank by 24h volume
+            if auto_n > 0:
+                symbols = _top_symbols_by_volume(client, auto_n, symbols)
+                print(f"  Auto-ranked top {auto_n} by 24h volume")
             print(f"  Watching: {', '.join(symbols)}")
             # Test WS order auth in a subprocess (avoids asyncio.run conflict)
             print(f"  Order channel…", end=" ", flush=True)
@@ -1421,10 +1601,13 @@ def main() -> None:
             sys.exit(1)
     else:
         print(f"{_YELLOW}Paper mode — no real orders will be placed{_RESET}")
-        print(f"  Watching: {', '.join(symbols)}")
-        print(f"  Equity  : {args.equity} USDT  (simulated)")
         if api_key:
             client = BybitClient(api_key, api_secret, testnet)
+            if auto_n > 0:
+                symbols = _top_symbols_by_volume(client, auto_n, symbols)
+                print(f"  Auto-ranked top {auto_n} by 24h volume")
+        print(f"  Watching: {', '.join(symbols)}")
+        print(f"  Equity  : {args.equity} USDT  (simulated)")
 
     print("Connecting to Bybit WebSocket…\n")
 
@@ -1439,6 +1622,7 @@ def main() -> None:
             signal_threshold = args.threshold,
             display_interval = args.display,
             client           = client,
+            close_on_exit    = args.close_on_exit,
         ))
     except KeyboardInterrupt:
         print("\nStopped.")
