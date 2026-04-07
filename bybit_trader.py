@@ -459,18 +459,18 @@ def _detect_regime_fast(prices: List[float]) -> str:
 
 # ── Signal decision (simple threshold on best backtest signal) ────────────────
 
-# Walk-forward v2: Simons OU + Momentum + Volatility are the only edges.
-# Poincaré now has multi-timeframe (H1/H4) support + sensitive 5-min thresholds.
+# Walk-forward v2: GPU-native signals, loaded from gpu_wf_results.json.
+# Falls back to these defaults if JSON not found.
 _BEST_SIGNAL: Dict[str, str] = {
-    "SOLUSDT":  "poincare_h1",
+    "SOLUSDT":  "simons",
     "LTCUSDT":  "momentum",
-    "LINKUSDT": "poincare_h1",
+    "LINKUSDT": "simons",
     "BTCUSDT":  "momentum",
-    "ETHUSDT":  "poincare_h1",
+    "ETHUSDT":  "momentum",
     "BNBUSDT":  "momentum",
-    "ADAUSDT":  "poincare_h1",
+    "ADAUSDT":  "momentum",
     "DOGEUSDT": "momentum",
-    "XRPUSDT":  "poincare_h1",
+    "XRPUSDT":  "simons",
 }
 
 # Sensitive thresholds: lower = more firing, higher = more selective.
@@ -1255,32 +1255,33 @@ class GpuAnalytics:
     sym_params:         Dict  = {}        # per-symbol {fast_w, slow_w, threshold}
 
     def _run(self) -> None:
-        """Feeder thread — snapshot prices every 0.5s, compute fast CPU signals,
-        and drop the latest snapshot into _latest_bufs for the writer thread.
-        Never touches the pipe directly — no blocking IO in this thread.
+        """Feeder thread — compute ALL signals on GPU every 0.5s.
+
+        Calls _compute_gpu_batch which runs torch on the GPU device:
+          • MA gap (fast/slow spread)
+          • Volatility z-score
+          • Poincaré topology (kNN density embedding)
+          • Simons OU mean-reversion z-score
+          • Hecke operator spectral dominance
+        All per symbol, in a single GPU batch (~15ms).
         """
         import time as _time
 
         while not self._stop:
             t0 = _time.monotonic()
-            # Include any symbol with at least 2 ticks — GPU worker handles short bufs fine
             bufs = {s: list(b) for s, b in self._bufs.items() if len(b) >= 2}
 
-            # ── Fast CPU signal computation ───────────────────────────────────
+            # ── GPU batch compute (all signals) ───────────────────────────────
             if bufs:
                 try:
-                    result = {s: self._compute_cpu(s, b) for s, b in bufs.items()}
+                    result = self._compute_gpu_batch(bufs)
                     self.signals.update(result)
                 except Exception:
                     pass
-
-            # ── Drop latest snapshot for writer thread ────────────────────────
-            if bufs:
-                self._latest_bufs = bufs   # atomic reference replace — writer picks it up
+                self._latest_bufs = bufs
 
             elapsed = _time.monotonic() - t0
-            # If we have data, pace at INTERVAL. If not, poll fast so first tick gets through.
-            wait = max(0.05, self.INTERVAL - elapsed) if bufs else 0.1
+            wait = max(0.1, 0.5 - elapsed) if bufs else 0.1
             _time.sleep(wait)
 
     def _stdin_writer(self) -> None:
@@ -1761,12 +1762,34 @@ async def _trading_loop(
                 if not enter_long and not enter_short:
                     continue
 
-                # Backtest signal gate — best signal per symbol (Order Flow, Simons, etc.)
+                # ── GPU-native signal gate ──────────────────────────────────────
+                # gpu.signals[sym] now contains poincare, simons_ou, and hecke
+                # computed on GPU in ~15ms per batch. Zero Python math needed.
+                poincare  = sig.get("poincare",  0.0)   # [-1, 1] topology score
+                simons_ou = sig.get("simons_ou",  0.0)   # [-1, 1] OU z-score
+                hecke     = sig.get("hecke",      0.0)   # [-1, 1] spectral dominance
+
+                # GPU signal gate: replaces slow _get_signal_score Python call
+                # (~200ms per call) with instant 0-cost dict lookup.
+                # Each best signal maps to the corresponding GPU field.
+                best_sig_name = _BEST_SIGNAL.get(sym, "simons_ou")
+                if best_sig_name in ("simons", "simons_ou"):
+                    gpu_gate_score = simons_ou
+                elif best_sig_name in ("poincare", "poincare_h1", "poincare_h4"):
+                    gpu_gate_score = poincare
+                elif best_sig_name == "momentum":
+                    gpu_gate_score = zscore        # GPU z-score ≈ momentum proxy
+                elif best_sig_name == "volatility":
+                    gpu_gate_score = vol
+                elif best_sig_name in ("hecke", "hecke_operator"):
+                    gpu_gate_score = hecke
+                else:
+                    gpu_gate_score = simons_ou     # fallback to best edge we have
+
                 if use_signals:
-                    score = _get_signal_score(sym, ctx.price_buf, ctx.volume_buf, ctx)
-                    if enter_long and score < signal_threshold:
+                    if enter_long and gpu_gate_score < signal_threshold:
                         continue
-                    if enter_short and score > -signal_threshold:
+                    if enter_short and gpu_gate_score > -signal_threshold:
                         continue
 
                 # Kelly-optimal sizing (capped at max_usdt)
