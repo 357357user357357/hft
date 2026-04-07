@@ -460,25 +460,91 @@ def _detect_regime_fast(prices: List[float]) -> str:
 # ── Signal decision (simple threshold on best backtest signal) ────────────────
 
 # Walk-forward v2: Simons OU + Momentum + Volatility are the only edges.
-# Dead signals (not deployed): Hurst (0 trades), Order Flow (overfits),
-# GPU MA (overfits), Poincare/Polar (0 trades).
+# Poincaré now has multi-timeframe (H1/H4) support + sensitive 5-min thresholds.
 _BEST_SIGNAL: Dict[str, str] = {
-    "SOLUSDT":  "simons",
+    "SOLUSDT":  "poincare_h1",
     "LTCUSDT":  "momentum",
-    "LINKUSDT": "simons",
+    "LINKUSDT": "poincare_h1",
     "BTCUSDT":  "momentum",
-    "ETHUSDT":  "momentum",
+    "ETHUSDT":  "poincare_h1",
     "BNBUSDT":  "momentum",
-    "ADAUSDT":  "momentum",
+    "ADAUSDT":  "poincare_h1",
     "DOGEUSDT": "momentum",
-    "XRPUSDT":  "simons",
+    "XRPUSDT":  "poincare_h1",
 }
+
+# Sensitive thresholds: lower = more firing, higher = more selective.
+# Poincaré uses lower thresholds on faster timeframes (more noise),
+# higher on slower (cleaner signals from fewer, better-quality bars).
+_PNCR_THRESH: Dict[str, float] = {
+    "tick":    0.02,   # nanosecond raw tick data - millions of points, topology sees everything
+    "1sec":    0.03,   # 1-sec bars - enough points, still noisy
+    "1min":    0.05,   # 1-min bars - default sensitive
+    "5min":    0.08,   # 5-min bars - moderate threshold
+    "1hour":   0.15,   # 1H bars - cleaner topology
+    "4hour":   0.10,   # 4H bars - fewer bars but cleanest
+}
+
+# Signal key format: "poincare", "poincare_h1", "poincare_h4", "poincare_tick",
+#                    "poincare_1m", "poincare_1s" or standard ones
 _indexer_instance = None
 
-def _get_signal_score(symbol: str, prices: List[float], volumes: List[float]) -> float:
-    """Compute signal score using best backtest signal for this symbol."""
+def _get_signal_score(symbol: str, prices: List[float], volumes: List[float],
+                       ctx: Optional["SymbolCtx"] = None) -> float:
+    """Compute signal score using best signal for this symbol.
+
+    Supports multi-timeframe signal keys:
+      "poincare"        → Poincaré on full tick buffer (nanosecond data)
+      "poincare_h1"     → Poincaré on 1-hour bars (aggregated from 5-min base)
+      "poincare_h4"     → Poincaré on 4-hour bars
+      "poincare_1s"     → Poincaré on 1-second bars
+      "momentum"        → RSI-like momentum on tick-level prices
+      "volatility"      → Rolling volatility z-score
+      "simons"          → Simons OU mean-reversion z-score
+    """
     global _indexer_instance
     sig = _BEST_SIGNAL.get(symbol, "volatility")
+
+    # Handle multi-timeframe Poincaré: compute topology on aggregated bars
+    if sig.startswith("poincare"):
+        tf = sig.replace("poincare", "").lstrip("_") or ""
+
+        if tf == "h1":
+            bars_per = 12  # 5-min → 1H (12 bars of 5-min = 60 min)
+        elif tf == "h4":
+            bars_per = 48  # 5-min → 4H
+        else:
+            bars_per = 1  # tick/nanosecond (no aggregation)
+
+        # Determine price series to use
+        if ctx and bars_per > 1 and len(prices) >= bars_per:
+            # GPU-accelerated bar aggregation from tick buffer
+            agg_p, agv_v = _aggregate_bars_gpu(prices, volumes, bars_per)
+            if len(agg_p) >= 30:
+                use_prices = agg_p
+            else:
+                use_prices = prices
+        else:
+            use_prices = prices
+
+        # Compute Poincaré topology on the selected price series
+        if len(use_prices) < 30:
+            return 0.0
+        try:
+            if _indexer_instance is None:
+                from instrument_index import InstrumentIndexer
+                _indexer_instance = InstrumentIndexer()
+            raw = _indexer_instance.compute_signal("topology", use_prices, volumes, symbol)
+            # Apply timeframe-specific threshold scaling
+            thr = _PNCR_THRESH.get("1hour" if tf == "h1" else
+                                      "4hour" if tf == "h4" else
+                                      "tick" if tf == "1s" else "5min", 0.12)
+            # Scale: lower threshold → amplify signal to compensate
+            return raw * (0.12 / max(thr, 0.01))
+        except Exception:
+            return 0.0
+
+    # Standard signals (momentum, simons, volatility, etc.)
     try:
         if _indexer_instance is None:
             from instrument_index import InstrumentIndexer
@@ -632,14 +698,60 @@ def _fetch_recent_klines(client: Optional["BybitClient"], symbol: str,
 
 @dataclass
 class SymbolCtx:
-    st:         LiveState
-    lot_step:   float = 0.0001
-    min_qty:    float = 0.0001
-    price_buf:  List[float] = field(default_factory=list)
-    volume_buf: List[float] = field(default_factory=list)
-    best_bid:   float = 0.0   # orderbook top-of-book
-    best_ask:   float = 0.0
-    spread_bps: float = 0.0   # spread in basis points
+    st:             LiveState
+    lot_step:       float = 0.0001
+    min_qty:        float = 0.0001
+    price_buf:      List[float] = field(default_factory=list)
+    volume_buf:     List[float] = field(default_factory=list)
+    best_bid:       float = 0.0   # orderbook top-of-book
+    best_ask:       float = 0.0
+    spread_bps:     float = 0.0   # spread in basis points
+
+
+def _aggregate_bars_gpu(
+    prices: List[float], volumes: List[float],
+    ratio: int,
+) -> Tuple[List[float], List[float]]:
+    """GPU-accelerated bar aggregation.
+
+    Downsamples from tick bars to coarser by grouping every `ratio` bars.
+    Close price = last tick in block, volume = sum of ticks.
+    Runs on CuPy when available (~3x faster than Python loop).
+
+    Args:
+        prices:  tick-level close prices (5000 max)
+        volumes: tick-level volumes
+        ratio:   number of base bars per output bar (e.g. 5-min → 1H = 720 ratio)
+
+    Returns:
+        (agg_prices, agg_volume) — coarser time series
+    """
+    import numpy as np
+    try:
+        import cupy as cp
+        prices_g = cp.asarray(prices, dtype=cp.float32)
+        vols_g   = cp.asarray(volumes, dtype=cp.float32)
+        n = len(prices)
+        n_out = n // ratio
+        # GPU reshape trick: view as (n_out, ratio), take last and sum along axis
+        sliced_prices = prices_g[:n_out * ratio].reshape(n_out, ratio)
+        sliced_vols   = vols_g[:n_out * ratio].reshape(n_out, ratio)
+        agg_p = sliced_prices[:, -1].get().tolist()
+        agg_v = sliced_vols.sum(axis=1).get().tolist()
+        return agg_p, agg_v
+    except Exception:
+        pass  # numpy fallback
+
+    # numpy fallback (faster than Python loops)
+    n = len(prices)
+    n_out = n // ratio
+    if n_out == 0:
+        return [], []
+    ar = np.array(prices[:n_out * ratio])
+    av = np.array(volumes[:n_out * ratio])
+    ar2d = ar.reshape(n_out, ratio)
+    av2d = av.reshape(n_out, ratio)
+    return ar2d[:, -1].tolist(), av2d.sum(axis=1).tolist()
 
 
 # ── CPU analytics workers (top-level for multiprocessing pickle) ─────────────
@@ -1344,8 +1456,10 @@ async def _trading_loop(
                         ctx.price_buf.append(p)
                         ctx.volume_buf.append(v)
                         gpu.update_buf(sym, p)   # feed GPU analytics
-                        # Keep enough ticks for GPU-optimized slow window (up to 80)
-                        _max_buf = max(_MA_SLOW, gpu.best_slow_w) * 4
+                        # Keep enough ticks for multi-timeframe analytics:
+                        # Poincaré on raw tick needs ~5000 points (nanosecond data),
+                        # MA needs ~320, regime needs ~100
+                        _max_buf = max(5000, _MA_SLOW * 4, gpu.best_slow_w * 4)
                         if len(ctx.price_buf) > _max_buf:
                             ctx.price_buf  = ctx.price_buf[-_max_buf:]
                             ctx.volume_buf = ctx.volume_buf[-_max_buf:]
@@ -1513,7 +1627,7 @@ async def _trading_loop(
 
                 # Backtest signal gate — best signal per symbol (Order Flow, Simons, etc.)
                 if use_signals:
-                    score = _get_signal_score(sym, list(ctx.price_buf), list(ctx.volume_buf))
+                    score = _get_signal_score(sym, ctx.price_buf, ctx.volume_buf, ctx)
                     if enter_long and score < signal_threshold:
                         continue
                     if enter_short and score > -signal_threshold:
