@@ -32,13 +32,18 @@ from data import load_agg_trades_csv
 from signal_backtest import SignalBacktest, SignalConfig, SignalStats
 
 # ── CPU signal track ───────────────────────────────────────────────────────────
+# Walk-forward v2 winners: Simons OU, Momentum, Volatility are the only edges.
+# Dead/negative signals: Hurst (0 trades), Autocorr (overfit), Order Flow (overfit),
+#                        Poincare, Polar, Torsion (removed earlier).
 SIGNALS: List[Tuple[str, str]] = [
-    ("order_flow", "Order Flow"),
-    ("volatility", "Volatility"),
-    ("hurst",      "Hurst Exponent"),
-    ("autocorr",   "Autocorrelation"),
     ("momentum",   "Momentum/RSI"),
+    ("simons",     "Simons OU"),
+    ("volatility", "Volatility"),
 ]
+# Stubbed (kept but not deployed):
+_STUBBED: List[Tuple[str, str]] = [
+    ("order_flow", "Order Flow"),
+    ("hur
 
 # Wider thresholds work better on 5-min bars
 THRESHOLDS = [0.40, 0.55, 0.70]

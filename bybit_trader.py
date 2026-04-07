@@ -459,15 +459,19 @@ def _detect_regime_fast(prices: List[float]) -> str:
 
 # ── Signal decision (simple threshold on best backtest signal) ────────────────
 
+# Walk-forward v2: Simons OU + Momentum + Volatility are the only edges.
+# Dead signals (not deployed): Hurst (0 trades), Order Flow (overfits),
+# GPU MA (overfits), Poincare/Polar (0 trades).
 _BEST_SIGNAL: Dict[str, str] = {
-    "SOLUSDT":  "volatility",
-    "LTCUSDT":  "polar",
-    "LINKUSDT": "order_flow",
-    "BTCUSDT":  "order_flow",
-    "ETHUSDT":  "order_flow",
-    "MATICUSDT": "hurst",
-    "ADAUSDT":  "poincare",
-    "DOGEUSDT": "poincare",
+    "SOLUSDT":  "simons",
+    "LTCUSDT":  "momentum",
+    "LINKUSDT": "simons",
+    "BTCUSDT":  "momentum",
+    "ETHUSDT":  "momentum",
+    "BNBUSDT":  "momentum",
+    "ADAUSDT":  "momentum",
+    "DOGEUSDT": "momentum",
+    "XRPUSDT":  "simons",
 }
 _indexer_instance = None
 
