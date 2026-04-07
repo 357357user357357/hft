@@ -410,7 +410,18 @@ def _render(states: List["LiveState"], live_mode: bool, client: Optional[BybitCl
                 h = cs.get("hurst", 0.5); o = cs.get("ofi", 0.5)
                 sh = cs.get("sharpe", 0.0)
                 cpu_str = (f"  {_DIM}H={h:.2f} OFI={o:.2f} Sh={sh:+.1f}{_RESET}")
-        print(f"  {st.symbol:<12} {price_str}  {pos_str}{spread_str}{cpu_str}")
+        # GPU-native signals annotation
+        gpu_sig_str = ""
+        if gpu:
+            gsig = gpu.signals.get(st.symbol, {})
+            if gsig and gsig.get("n", 0) > 2:
+                p  = gsig.get("poincare",  0.0)
+                so = gsig.get("simons_ou", 0.0)
+                hk = gsig.get("hecke",     0.0)
+                best_name = _best_signal.get(st.symbol, "?")
+                # Highlight the active signal
+                gpu_sig_str = f"  {_DIM}P={p:+.2f} OU={so:+.2f} Hk={hk:+.2f}{_RESET}  {_BOLD}->{best_name}{_RESET}"
+        print(f"  {st.symbol:<12} {price_str}  {pos_str}{spread_str}{cpu_str}{gpu_sig_str}")
 
     print(f"\n{_BOLD}{'─'*70}{_RESET}")
     print(f"  {_DIM}Ctrl+C to stop{_RESET}", flush=True)
@@ -462,15 +473,15 @@ def _detect_regime_fast(prices: List[float]) -> str:
 # Walk-forward v2: GPU-native signals, loaded from gpu_wf_results.json at startup.
 # _best_signal is mutable — overwritten by walk-forward results if available.
 _DEFAULT_BEST_SIGNAL: Dict[str, str] = {
-    "SOLUSDT":  "volatility",
-    "LTCUSDT":  "volatility",
-    "LINKUSDT": "simons_ou",
-    "BTCUSDT":  "simons_ou",
-    "ETHUSDT":  "autocorr",
-    "BNBUSDT":  "autocorr",
-    "ADAUSDT":  "momentum",
-    "DOGEUSDT": "autocorr",
-    "XRPUSDT":  "momentum",
+    "SOLUSDT":  "autocorr",      # OOS +3.87 (29 folds)
+    "LTCUSDT":  "autocorr",      # OOS +0.73 (140 folds)
+    "LINKUSDT": "zscore",        # OOS +1.95 (30 folds, momentum≈zscore)
+    "BTCUSDT":  "simons_ou",     # OOS +0.88 (60 folds)
+    "ETHUSDT":  "autocorr",      # OOS +3.87 (87 folds)
+    "BNBUSDT":  "autocorr",      # OOS +1.45 (84 folds)
+    "ADAUSDT":  "simons_ou",     # OOS +0.97 (30 folds)
+    "DOGEUSDT": "simons_ou",     # OOS +1.27 (29 folds)
+    "XRPUSDT":  "autocorr",      # OOS +1.46 (145 folds)
 }
 _best_signal: Dict[str, str] = dict(_DEFAULT_BEST_SIGNAL)
 
@@ -1993,6 +2004,9 @@ def main() -> None:
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     auto_n  = args.auto_symbols   # 0 = disabled
+
+    # Load walk-forward results → update _best_signal from actual data
+    _load_wf_results()
 
     # Load credentials
     api_key    = os.environ.get("BYBIT_API_KEY",    "")
