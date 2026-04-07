@@ -541,8 +541,13 @@ def main() -> None:
     # ── Save results to JSON (loaded by bybit_trader.py at startup) ───────────
     _out_file = os.path.join(os.path.dirname(__file__), "gpu_wf_results.json")
     import json
+    # Convert numpy types to Python native types for JSON serialization
+    def _conv(v):
+        if hasattr(v, "item"):
+            return v.item()
+        return v
+
     with open(_out_file, "w") as _f:
-        # Build per-symbol best signal info for live trader
         sym_best_signal = {}
         for sym, folds in sym_best.items():
             by_sig = {}
@@ -551,20 +556,23 @@ def main() -> None:
             ranked = sorted(by_sig.items(), key=lambda x: sum(x[1])/len(x[1]), reverse=True)
             if ranked:
                 name, sharps = ranked[0]
-                sym_best_signal[sym] = best_sym_signal = {
+                sym_best_signal[sym] = {
                     "signal": name,
-                    "avg_oos_sharpe": sum(sharps)/len(sharps),
+                    "avg_oos_sharpe": float(sum(sharps)/len(sharps)),
                     "folds": len(sharps),
                 }
 
         json.dump({
-            "folds":           all_results,
+            "folds": [
+                {k: _conv(v) for k, v in f.items()}
+                for f in all_results
+            ],
             "best_per_symbol": sym_best_signal,
             "summary": {
                 sig: {
-                    "avg_oos_sharpe": sum(f["oos_sh"] for f in fl) / len(fl),
-                    "avg_oos_pnl":    sum(f["oos_pnl"] for f in fl) / len(fl),
-                    "avg_winrate":    sum(f["oos_wr"] for f in fl) / len(fl),
+                    "avg_oos_sharpe": float(sum(f["oos_sh"] for f in fl) / len(fl)),
+                    "avg_oos_pnl":    float(sum(f["oos_pnl"] for f in fl) / len(fl)),
+                    "avg_winrate":    float(sum(f["oos_wr"] for f in fl) / len(fl)),
                     "folds":          len(fl),
                 }
                 for sig, fl in sig_agg.items()

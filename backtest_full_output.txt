@@ -1,0 +1,227 @@
+Probing GPU (CuPy)… not available — using CPU only
+
+Running 9 instruments × 14 signals = 126 jobs
+Symbols : ADAUSDT, BNBUSDT, BTCUSDT, DOGEUSDT, ETHUSDT, LINKUSDT, LTCUSDT, SOLUSDT, XRPUSDT
+Dispatch: CPU workers: 8 (NumPy vectorised)
+
+  [  1/126] ADAUSDT    Hurst Exponent                trades= 195  win= 51.8%  pnl= +1.945%  sharpe=  0.73
+  [  2/126] ADAUSDT    Momentum/RSI                  trades= 165  win= 47.3%  pnl= -6.562%  sharpe= -2.89
+  [  3/126] ADAUSDT    Polar Coords                  trades=   0  win=  0.0%  pnl= +0.000%  sharpe=  0.00
+  [  4/126] ADAUSDT    FEL Semigroup                 trades=   0  win=  0.0%  pnl= +0.000%  sharpe=  0.00
+  [  5/126] ADAUSDT    Order Flow                    trades=  98  win= 43.9%  pnl= -2.013%  sharpe= -1.34
+  [  6/126] ADAUSDT    Simons SDEs                   trades= 156  win= 53.2%  pnl= +1.496%  sharpe=  0.65
+  [  7/126] ADAUSDT    Frenet-Serret                 trades=   0  win=  0.0%  pnl= +0.000%  sharpe=  0.00
+  [  8/126] ADAUSDT    Poincaré Topology      [CPU*] trades= 145  win= 51.7%  pnl= +1.654%  sharpe=  0.80
+  [  9/126] ADAUSDT    Autocorrelation               trades= 150  win= 48.0%  pnl= +0.244%  sharpe=  0.11
+  [ 10/126] ADAUSDT    Volatility                    trades= 163  win= 47.2%  pnl= -0.410%  sharpe= -0.18
+  [ 11/126] ADAUSDT    Quaternion                    trades= 147  win= 50.3%  pnl= +0.445%  sharpe=  0.20
+  [ 12/126] ADAUSDT    Spectral/Hecke                trades= 149  win= 49.0%  pnl= -0.259%  sharpe= -0.11
+  [ 13/126] BNBUSDT    Polar Coords                  trades= 550  win= 47.5%  pnl= -4.428%  sharpe= -0.83
+  [ 14/126] ADAUSDT    Whitehead Torsion      [CPU*] trades= 155  win= 52.3%  pnl= +0.696%  sharpe=  0.31
+  [ 15/126] BNBUSDT    Hurst Exponent                trades= 749  win= 47.3%  pnl= -8.233%  sharpe= -1.27
+  [ 16/126] BNBUSDT    Momentum/RSI                  trades= 717  win= 49.8%  pnl= -7.958%  sharpe= -1.28
+  [ 17/126] BNBUSDT    Frenet-Serret                 trades= 332  win= 49.7%  pnl= +0.241%  sharpe=  0.08
+  [ 18/126] BNBUSDT    Poincaré Topology      [CPU*] trades= 590  win= 49.8%  pnl= +1.023%  sharpe=  0.18
+  [ 19/126] BNBUSDT    FEL Semigroup                 trades=   0  win=  0.0%  pnl= +0.000%  sharpe=  0.00
+  [ 20/126] BNBUSDT    Order Flow                    trades= 495  win= 53.1%  pnl= +6.864%  sharpe=  1.53
+  [ 21/126] BNBUSDT    Simons SDEs                   trades= 650  win= 50.2%  pnl= +5.557%  sharpe=  0.95
+  [ 22/126] BNBUSDT    Autocorrelation               trades= 608  win= 47.0%  pnl= -4.275%  sharpe= -0.72
+  [ 23/126] BNBUSDT    Volatility                    trades= 679  win= 52.3%  pnl= -2.585%  sharpe= -0.43
+  [ 24/126] BNBUSDT    Quaternion                    trades= 396  win= 49.2%  pnl= -3.525%  sharpe= -0.92
+  [ 25/126] ADAUSDT    Composite (all 19)            trades=  34  win= 41.2%  pnl= -1.181%  sharpe= -2.02
+  [ 26/126] BNBUSDT    Spectral/Hecke                trades= 608  win= 52.3%  pnl= +5.311%  sharpe=  0.90
+  [ 27/126] BTCUSDT    Polar Coords                  trades=1719  win= 48.8%  pnl= -1.861%  sharpe= -0.31
+  [ 28/126] BNBUSDT    Whitehead Torsion      [CPU*] trades= 632  win= 52.7%  pnl= +5.127%  sharpe=  0.85
+  [ 29/126] BTCUSDT    Frenet-Serret                 trades=1721  win= 51.1%  pnl= +1.849%  sharpe=  0.31
+  [ 30/126] BTCUSDT    Hurst Exponent                trades=2071  win= 48.5%  pnl= -2.412%  sharpe= -0.37
+  [ 31/126] BTCUSDT    Poincaré Topology      [CPU*] trades=1653  win= 49.6%  pnl= -3.973%  sharpe= -0.72
+  [ 32/126] BTCUSDT    Momentum/RSI                  trades=2013  win= 52.4%  pnl= -7.429%  sharpe= -1.19
+  [ 33/126] BTCUSDT    FEL Semigroup                 trades=   0  win=  0.0%  pnl= +0.000%  sharpe=  0.00
+  [ 34/126] BTCUSDT    Order Flow                    trades=1309  win= 52.9%  pnl= +2.162%  sharpe=  0.48
+  [ 35/126] BTCUSDT    Autocorrelation               trades=1724  win= 48.7%  pnl= -2.608%  sharpe= -0.43
+  [ 36/126] BTCUSDT    Simons SDEs                   trades=1874  win= 49.6%  pnl= +2.739%  sharpe=  0.45
+  [ 37/126] DOGEUSDT   Poincaré Topology      [CPU*] trades= 118  win= 58.5%  pnl= +3.869%  sharpe=  2.93
+  [ 38/126] BTCUSDT    Volatility                    trades=1893  win= 51.8%  pnl= +0.452%  sharpe=  0.07
+  [ 39/126] DOGEUSDT   Frenet-Serret                 trades=   0  win=  0.0%  pnl= +0.000%  sharpe=  0.00
+  [ 40/126] DOGEUSDT   Polar Coords                  trades=   0  win=  0.0%  pnl= +0.000%  sharpe=  0.00
+  [ 41/126] BTCUSDT    Quaternion                    trades=1721  win= 48.8%  pnl= -1.849%  sharpe= -0.31
+  [ 42/126] DOGEUSDT   Hurst Exponent                trades= 173  win= 48.0%  pnl= -0.819%  sharpe= -0.44
+  [ 43/126] DOGEUSDT   Momentum/RSI                  trades= 152  win= 51.3%  pnl= -0.709%  sharpe= -0.41
+  [ 44/126] DOGEUSDT   Whitehead Torsion      [CPU*] trades= 136  win= 54.4%  pnl= +3.065%  sharpe=  1.83
+  [ 45/126] DOGEUSDT   Simons SDEs                   trades= 137  win= 48.2%  pnl= -0.895%  sharpe= -0.59
+  [ 46/126] DOGEUSDT   FEL Semigroup                 trades=   0  win=  0.0%  pnl= +0.000%  sharpe=  0.00
+  [ 47/126] DOGEUSDT   Order Flow                    trades=  90  win= 54.4%  pnl= +0.029%  sharpe=  0.03
+  [ 48/126] DOGEUSDT   Autocorrelation               trades= 129  win= 46.5%  pnl= -0.945%  sharpe= -0.61
+  [ 49/126] DOGEUSDT   Volatility                    trades= 145  win= 45.5%  pnl= -1.520%  sharpe= -0.92
+  [ 50/126] DOGEUSDT   Quaternion                    trades= 121  win= 48.8%  pnl= -1.916%  sharpe= -1.31
+  [ 51/126] DOGEUSDT   Spectral/Hecke                trades= 129  win= 54.3%  pnl= +0.930%  sharpe=  0.64
+  [ 52/126] DOGEUSDT   Composite (all 19)            trades=  25  win= 48.0%  pnl= +0.530%  sharpe=  1.82
+  [ 53/126] ETHUSDT    Poincaré Topology      [CPU*] trades=1150  win= 51.7%  pnl= +0.712%  sharpe=  0.16
+  [ 54/126] ETHUSDT    Frenet-Serret                 trades=1085  win= 52.2%  pnl= +1.954%  sharpe=  0.44
+  [ 55/126] ETHUSDT    Polar Coords                  trades=1209  win= 49.0%  pnl= -1.538%  sharpe= -0.32
+  [ 56/126] BTCUSDT    Spectral/Hecke                trades=1721  win= 51.1%  pnl= +1.849%  sharpe=  0.31
+  [ 57/126] ETHUSDT    Hurst Exponent                trades=1464  win= 49.8%  pnl= -1.572%  sharpe= -0.30
+  [ 58/126] ETHUSDT    Momentum/RSI                  trades=1422  win= 53.1%  pnl= -3.649%  sharpe= -0.71
+  [ 59/126] BTCUSDT    Whitehead Torsion      [CPU*] trades=1803  win= 50.4%  pnl= +1.502%  sharpe=  0.24
+  [ 60/126] ETHUSDT    FEL Semigroup                 trades=   0  win=  0.0%  pnl= +0.000%  sharpe=  0.00
+  [ 61/126] BNBUSDT    Composite (all 19)            trades= 147  win= 54.4%  pnl= +0.818%  sharpe=  0.65
+  [ 62/126] ETHUSDT    Simons SDEs                   trades=1321  win= 49.9%  pnl= +3.470%  sharpe=  0.71
+  [ 63/126] ETHUSDT    Order Flow                    trades=1005  win= 51.5%  pnl= +3.315%  sharpe=  0.83
+  [ 64/126] ETHUSDT    Autocorrelation               trades=1227  win= 50.0%  pnl= -1.416%  sharpe= -0.29
+  [ 65/126] ETHUSDT    Quaternion                    trades=1160  win= 47.5%  pnl= -1.977%  sharpe= -0.42
+  [ 66/126] ETHUSDT    Volatility                    trades=1377  win= 51.7%  pnl= -1.147%  sharpe= -0.23
+  [ 67/126] LINKUSDT   Poincaré Topology      [CPU*] trades= 422  win= 46.4%  pnl= +0.493%  sharpe=  0.08
+  [ 68/126] LINKUSDT   Frenet-Serret                 trades=  26  win= 42.3%  pnl= -0.831%  sharpe= -2.42
+  [ 69/126] LINKUSDT   Polar Coords                  trades=   0  win=  0.0%  pnl= +0.000%  sharpe=  0.00
+  [ 70/126] LINKUSDT   Hurst Exponent                trades= 625  win= 46.2%  pnl= -7.189%  sharpe= -0.96
+  [ 71/126] LINKUSDT   Momentum/RSI                  trades= 515  win= 48.5%  pnl= -8.500%  sharpe= -1.29
+  [ 72/126] LINKUSDT   Simons SDEs                   trades= 511  win= 54.4%  pnl= +9.077%  sharpe=  1.35
+  [ 73/126] ETHUSDT    Whitehead Torsion      [CPU*] trades=1289  win= 50.2%  pnl= +1.205%  sharpe=  0.24
+  [ 74/126] LINKUSDT   FEL Semigroup                 trades=   0  win=  0.0%  pnl= +0.000%  sharpe=  0.00
+  [ 75/126] LINKUSDT   Order Flow                    trades= 343  win= 56.6%  pnl= +9.010%  sharpe=  1.91
+  [ 76/126] LINKUSDT   Autocorrelation               trades= 451  win= 48.6%  pnl= -2.501%  sharpe= -0.40
+  [ 77/126] LINKUSDT   Volatility                    trades= 503  win= 50.7%  pnl= +1.568%  sharpe=  0.24
+  [ 78/126] LINKUSDT   Quaternion                    trades= 333  win= 47.1%  pnl= -2.660%  sharpe= -0.56
+  [ 79/126] ETHUSDT    Spectral/Hecke                trades=1227  win= 50.3%  pnl= +1.485%  sharpe=  0.30
+  [ 80/126] LTCUSDT    Poincaré Topology      [CPU*] trades= 115  win= 46.1%  pnl= -0.109%  sharpe= -0.07
+  [ 81/126] LINKUSDT   Whitehead Torsion      [CPU*] trades= 468  win= 48.7%  pnl= -0.617%  sharpe= -0.10
+  [ 82/126] LTCUSDT    Frenet-Serret                 trades=  13  win= 53.8%  pnl= +0.153%  sharpe=  1.32
+  [ 83/126] LTCUSDT    Polar Coords                  trades=  59  win= 57.6%  pnl= +2.597%  sharpe=  3.02
+  [ 84/126] LTCUSDT    Hurst Exponent                trades= 138  win= 45.7%  pnl= -0.184%  sharpe= -0.10
+  [ 85/126] LTCUSDT    Momentum/RSI                  trades= 134  win= 47.0%  pnl= -3.559%  sharpe= -2.08
+  [ 86/126] LINKUSDT   Spectral/Hecke                trades= 451  win= 50.6%  pnl= +2.501%  sharpe=  0.40
+  [ 87/126] LTCUSDT    FEL Semigroup                 trades=   0  win=  0.0%  pnl= +0.000%  sharpe=  0.00
+  [ 88/126] LTCUSDT    Simons SDEs                   trades= 120  win= 51.7%  pnl= +0.551%  sharpe=  0.32
+  [ 89/126] LTCUSDT    Order Flow                    trades=  89  win= 58.4%  pnl= +1.389%  sharpe=  1.10
+  [ 90/126] LTCUSDT    Autocorrelation               trades= 113  win= 51.3%  pnl= +1.378%  sharpe=  0.89
+  [ 91/126] LTCUSDT    Volatility                    trades= 131  win= 51.1%  pnl= +3.935%  sharpe=  2.13
+  [ 92/126] LTCUSDT    Quaternion                    trades= 109  win= 47.7%  pnl= +1.563%  sharpe=  0.96
+  [ 93/126] LTCUSDT    Whitehead Torsion      [CPU*] trades= 115  win= 46.1%  pnl= -1.771%  sharpe= -1.12
+  [ 94/126] LTCUSDT    Spectral/Hecke                trades= 113  win= 47.8%  pnl= -1.378%  sharpe= -0.89
+  [ 95/126] LTCUSDT    Composite (all 19)            trades=  24  win= 33.3%  pnl= -1.435%  sharpe= -4.48
+  [ 96/126] SOLUSDT    Frenet-Serret                 trades= 278  win= 52.9%  pnl= -0.656%  sharpe= -0.33
+  [ 97/126] SOLUSDT    Polar Coords                  trades= 227  win= 50.7%  pnl= -0.522%  sharpe= -0.32
+  [ 98/126] SOLUSDT    Poincaré Topology      [CPU*] trades=1279  win= 48.6%  pnl= -1.629%  sharpe= -0.18
+  [ 99/126] SOLUSDT    Hurst Exponent                trades=1617  win= 48.1%  pnl= -3.092%  sharpe= -0.29
+  [100/126] SOLUSDT    Momentum/RSI                  trades=1578  win= 53.9%  pnl= -2.694%  sharpe= -0.26
+  [101/126] SOLUSDT    FEL Semigroup                 trades=   0  win=  0.0%  pnl= +0.000%  sharpe=  0.00
+  [102/126] SOLUSDT    Simons SDEs                   trades=1468  win= 48.2%  pnl= +1.452%  sharpe=  0.15
+  [103/126] SOLUSDT    Order Flow                    trades=1025  win= 50.1%  pnl= +1.421%  sharpe=  0.19
+  [104/126] SOLUSDT    Autocorrelation               trades=1348  win= 48.7%  pnl= +0.090%  sharpe=  0.01
+  [105/126] LINKUSDT   Composite (all 19)            trades=  97  win= 50.5%  pnl= +0.092%  sharpe=  0.07
+  [106/126] SOLUSDT    Volatility                    trades=1510  win= 52.3%  pnl= +6.732%  sharpe=  0.68
+  [107/126] SOLUSDT    Quaternion                    trades= 436  win= 49.1%  pnl= +0.444%  sharpe=  0.14
+  [108/126] XRPUSDT    Poincaré Topology      [CPU*] trades= 187  win= 52.4%  pnl= +1.614%  sharpe=  0.90
+  [109/126] XRPUSDT    Frenet-Serret                 trades=   2  win=100.0%  pnl= +0.214%  sharpe= 40.14
+  [110/126] XRPUSDT    Polar Coords                  trades=   0  win=  0.0%  pnl= +0.000%  sharpe=  0.00
+  [111/126] XRPUSDT    Hurst Exponent                trades= 249  win= 50.2%  pnl= +1.391%  sharpe=  0.64
+  [112/126] XRPUSDT    Momentum/RSI                  trades= 225  win= 49.3%  pnl= -2.425%  sharpe= -1.19
+  [113/126] XRPUSDT    Simons SDEs                   trades= 204  win= 49.5%  pnl= +1.300%  sharpe=  0.69
+  [114/126] XRPUSDT    Whitehead Torsion      [CPU*] trades= 200  win= 53.5%  pnl= +0.109%  sharpe=  0.06
+  [115/126] XRPUSDT    FEL Semigroup                 trades=   0  win=  0.0%  pnl= +0.000%  sharpe=  0.00
+  [116/126] XRPUSDT    Order Flow                    trades= 155  win= 52.9%  pnl= +0.359%  sharpe=  0.24
+  [117/126] XRPUSDT    Autocorrelation               trades= 196  win= 48.5%  pnl= +0.053%  sharpe=  0.03
+  [118/126] XRPUSDT    Volatility                    trades= 203  win= 51.7%  pnl= +0.738%  sharpe=  0.39
+  [119/126] XRPUSDT    Spectral/Hecke                trades= 195  win= 50.3%  pnl= -1.126%  sharpe= -0.61
+  [120/126] XRPUSDT    Quaternion                    trades= 193  win= 48.7%  pnl= +1.101%  sharpe=  0.61
+  [121/126] SOLUSDT    Spectral/Hecke                trades=1349  win= 50.7%  pnl= +0.252%  sharpe=  0.03
+  [122/126] SOLUSDT    Whitehead Torsion      [CPU*] trades=1423  win= 51.3%  pnl= +3.834%  sharpe=  0.39
+  [123/126] XRPUSDT    Composite (all 19)            trades=  39  win= 56.4%  pnl= -0.137%  sharpe= -0.35
+  [124/126] ETHUSDT    Composite (all 19)            trades= 276  win= 52.2%  pnl= +0.941%  sharpe=  0.89
+  [125/126] BTCUSDT    Composite (all 19)            trades= 286  win= 49.3%  pnl= -0.658%  sharpe= -0.58
+  [126/126] SOLUSDT    Composite (all 19)            trades= 320  win= 51.6%  pnl= -0.615%  sharpe= -0.28
+
+
+===============================================================================================
+BEST INSTRUMENT PER SIGNAL  (by Sharpe)
+===============================================================================================
+  Composite (all 19)     → DOGEUSDT    sharpe=  1.82  pnl= +0.530%  win= 48.0%  trades=25
+  Poincaré Topology      → DOGEUSDT    sharpe=  2.93  pnl= +3.869%  win= 58.5%  trades=118
+  Whitehead Torsion      → DOGEUSDT    sharpe=  1.83  pnl= +3.065%  win= 54.4%  trades=136
+  Frenet-Serret          → XRPUSDT     sharpe= 40.14  pnl= +0.214%  win=100.0%  trades=2
+  Polar Coords           → LTCUSDT     sharpe=  3.02  pnl= +2.597%  win= 57.6%  trades=59
+  Hurst Exponent         → ADAUSDT     sharpe=  0.73  pnl= +1.945%  win= 51.8%  trades=195
+  Momentum/RSI           → SOLUSDT     sharpe= -0.26  pnl= -2.694%  win= 53.9%  trades=1578
+  Simons SDEs            → LINKUSDT    sharpe=  1.35  pnl= +9.077%  win= 54.4%  trades=511
+  Spectral/Hecke         → BNBUSDT     sharpe=  0.90  pnl= +5.311%  win= 52.3%  trades=608
+  Order Flow             → LINKUSDT    sharpe=  1.91  pnl= +9.010%  win= 56.6%  trades=343
+  Autocorrelation        → LTCUSDT     sharpe=  0.89  pnl= +1.378%  win= 51.3%  trades=113
+  Volatility             → LTCUSDT     sharpe=  2.13  pnl= +3.935%  win= 51.1%  trades=131
+  Quaternion             → LTCUSDT     sharpe=  0.96  pnl= +1.563%  win= 47.7%  trades=109
+
+===============================================================================================
+BEST SIGNAL PER INSTRUMENT  (by Sharpe)
+===============================================================================================
+  ADAUSDT    → Poincaré Topology       sharpe=  0.80  pnl= +1.654%  win= 51.7%  trades=145
+  BNBUSDT    → Order Flow              sharpe=  1.53  pnl= +6.864%  win= 53.1%  trades=495
+  BTCUSDT    → Order Flow              sharpe=  0.48  pnl= +2.162%  win= 52.9%  trades=1309
+  DOGEUSDT   → Poincaré Topology       sharpe=  2.93  pnl= +3.869%  win= 58.5%  trades=118
+  ETHUSDT    → Composite (all 19)      sharpe=  0.89  pnl= +0.941%  win= 52.2%  trades=276
+  LINKUSDT   → Order Flow              sharpe=  1.91  pnl= +9.010%  win= 56.6%  trades=343
+  LTCUSDT    → Polar Coords            sharpe=  3.02  pnl= +2.597%  win= 57.6%  trades=59
+  SOLUSDT    → Volatility              sharpe=  0.68  pnl= +6.732%  win= 52.3%  trades=1510
+  XRPUSDT    → Frenet-Serret           sharpe= 40.14  pnl= +0.214%  win=100.0%  trades=2
+
+===============================================================================================
+ALL INSTRUMENTS — RANKED BY TOTAL PnL (sum across all signals)
+===============================================================================================
+  SOLUSDT     pnl=+5.018%  best_sharpe=  0.68  trades=13858  ███████
+  XRPUSDT     pnl=+3.191%  best_sharpe= 40.14  trades=2048  ████
+  LTCUSDT     pnl=+3.131%  best_sharpe=  3.02  trades=1273  ████
+  ETHUSDT     pnl=+1.784%  best_sharpe=  0.89  trades=15212  ██
+  DOGEUSDT    pnl=+1.620%  best_sharpe=  2.93  trades=1355  ██
+  LINKUSDT    pnl=+0.442%  best_sharpe=  1.91  trades=4745  
+  ADAUSDT     pnl=-3.945%  best_sharpe=  0.80  trades=1557  █████
+  BNBUSDT     pnl=-6.062%  best_sharpe=  1.53  trades=7153  █████████
+  BTCUSDT     pnl=-10.237%  best_sharpe=  0.48  trades=21508  ███████████████
+
+===============================================================================================
+TOP 3 SIGNALS PER INSTRUMENT
+===============================================================================================
+
+  ADAUSDT:
+    1. Poincaré Topology       sharpe=  0.80  pnl= +1.654%  win= 51.7%  trades=145
+    2. Hurst Exponent          sharpe=  0.73  pnl= +1.945%  win= 51.8%  trades=195
+    3. Simons SDEs             sharpe=  0.65  pnl= +1.496%  win= 53.2%  trades=156
+
+  BNBUSDT:
+    1. Order Flow              sharpe=  1.53  pnl= +6.864%  win= 53.1%  trades=495
+    2. Simons SDEs             sharpe=  0.95  pnl= +5.557%  win= 50.2%  trades=650
+    3. Spectral/Hecke          sharpe=  0.90  pnl= +5.311%  win= 52.3%  trades=608
+
+  BTCUSDT:
+    1. Order Flow              sharpe=  0.48  pnl= +2.162%  win= 52.9%  trades=1309
+    2. Simons SDEs             sharpe=  0.45  pnl= +2.739%  win= 49.6%  trades=1874
+    3. Frenet-Serret           sharpe=  0.31  pnl= +1.849%  win= 51.1%  trades=1721
+
+  DOGEUSDT:
+    1. Poincaré Topology       sharpe=  2.93  pnl= +3.869%  win= 58.5%  trades=118
+    2. Whitehead Torsion       sharpe=  1.83  pnl= +3.065%  win= 54.4%  trades=136
+    3. Composite (all 19)      sharpe=  1.82  pnl= +0.530%  win= 48.0%  trades=25
+
+  ETHUSDT:
+    1. Composite (all 19)      sharpe=  0.89  pnl= +0.941%  win= 52.2%  trades=276
+    2. Order Flow              sharpe=  0.83  pnl= +3.315%  win= 51.5%  trades=1005
+    3. Simons SDEs             sharpe=  0.71  pnl= +3.470%  win= 49.9%  trades=1321
+
+  LINKUSDT:
+    1. Order Flow              sharpe=  1.91  pnl= +9.010%  win= 56.6%  trades=343
+    2. Simons SDEs             sharpe=  1.35  pnl= +9.077%  win= 54.4%  trades=511
+    3. Spectral/Hecke          sharpe=  0.40  pnl= +2.501%  win= 50.6%  trades=451
+
+  LTCUSDT:
+    1. Polar Coords            sharpe=  3.02  pnl= +2.597%  win= 57.6%  trades=59
+    2. Volatility              sharpe=  2.13  pnl= +3.935%  win= 51.1%  trades=131
+    3. Frenet-Serret           sharpe=  1.32  pnl= +0.153%  win= 53.8%  trades=13
+
+  SOLUSDT:
+    1. Volatility              sharpe=  0.68  pnl= +6.732%  win= 52.3%  trades=1510
+    2. Whitehead Torsion       sharpe=  0.39  pnl= +3.834%  win= 51.3%  trades=1423
+    3. Order Flow              sharpe=  0.19  pnl= +1.421%  win= 50.1%  trades=1025
+
+  XRPUSDT:
+    1. Frenet-Serret           sharpe= 40.14  pnl= +0.214%  win=100.0%  trades=2
+    2. Poincaré Topology       sharpe=  0.90  pnl= +1.614%  win= 52.4%  trades=187
+    3. Simons SDEs             sharpe=  0.69  pnl= +1.300%  win= 49.5%  trades=204
+
+[GPU] Not available — all signals ran on CPU with NumPy vectorisation

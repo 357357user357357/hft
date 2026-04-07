@@ -459,19 +459,44 @@ def _detect_regime_fast(prices: List[float]) -> str:
 
 # ── Signal decision (simple threshold on best backtest signal) ────────────────
 
-# Walk-forward v2: GPU-native signals, loaded from gpu_wf_results.json.
-# Falls back to these defaults if JSON not found.
-_BEST_SIGNAL: Dict[str, str] = {
-    "SOLUSDT":  "simons",
-    "LTCUSDT":  "momentum",
-    "LINKUSDT": "simons",
-    "BTCUSDT":  "momentum",
-    "ETHUSDT":  "momentum",
-    "BNBUSDT":  "momentum",
+# Walk-forward v2: GPU-native signals, loaded from gpu_wf_results.json at startup.
+# _best_signal is mutable — overwritten by walk-forward results if available.
+_DEFAULT_BEST_SIGNAL: Dict[str, str] = {
+    "SOLUSDT":  "volatility",
+    "LTCUSDT":  "volatility",
+    "LINKUSDT": "simons_ou",
+    "BTCUSDT":  "simons_ou",
+    "ETHUSDT":  "autocorr",
+    "BNBUSDT":  "autocorr",
     "ADAUSDT":  "momentum",
-    "DOGEUSDT": "momentum",
-    "XRPUSDT":  "simons",
+    "DOGEUSDT": "autocorr",
+    "XRPUSDT":  "momentum",
 }
+_best_signal: Dict[str, str] = dict(_DEFAULT_BEST_SIGNAL)
+
+def _load_wf_results() -> None:
+    """Load gpu_wf_results.json and update _best_signal with walk-forward winners."""
+    import json
+    wf_path = os.path.join(os.path.dirname(__file__), "gpu_wf_results.json")
+    if not os.path.exists(wf_path):
+        return
+    try:
+        with open(wf_path) as f:
+            data = json.load(f)
+        best = data.get("best_per_symbol", {})
+        for sym, info in best.items():
+            sig_name = info.get("signal", "")
+            sharpe = float(info.get("avg_oos_sharpe", 0))
+            folds  = int(info.get("folds", 0))
+            if folds >= 2 and sharpe > 0:
+                gpu_key = {
+                    "simons_ou": "simons_ou", "volatility": "volatility",
+                    "momentum": "zscore", "autocorrelation": "autocorr",
+                    "poincare": "poincare", "hecke": "hecke",
+                }.get(sig_name, "simons_ou")
+                _best_signal[sym] = gpu_key
+    except Exception as e:
+        print(f"  WF results load failed: {e}")
 
 # Sensitive thresholds: lower = more firing, higher = more selective.
 # Poincaré uses lower thresholds on faster timeframes (more noise),
@@ -503,7 +528,7 @@ def _get_signal_score(symbol: str, prices: List[float], volumes: List[float],
       "simons"          → Simons OU mean-reversion z-score
     """
     global _indexer_instance
-    sig = _BEST_SIGNAL.get(symbol, "volatility")
+    sig = _best_signal.get(symbol, "volatility")
 
     # Handle multi-timeframe Poincaré: compute topology on aggregated bars
     if sig.startswith("poincare"):
@@ -1160,9 +1185,7 @@ class GpuAnalytics:
 
             # Remove self-distance (diagonal), sort, take k nearest
             k_neighbors = min(6, K - 1)
-            diag_ids = torch.arange(K, device=self.device)
-            for _bn in range(N):
-                dmat[_bn, diag_ids, diag_ids] = float('inf')
+            dmat[:, torch.arange(K, device=self.device), torch.arange(K, device=self.device)] = float('inf')
             knn_dists, _ = dmat.sort(dim=2)
             knn_avg = knn_dists[:, :, :k_neighbors].mean(dim=2)     # (N, K)
 
@@ -1772,7 +1795,7 @@ async def _trading_loop(
                 # GPU signal gate: replaces slow _get_signal_score Python call
                 # (~200ms per call) with instant 0-cost dict lookup.
                 # Each best signal maps to the corresponding GPU field.
-                best_sig_name = _BEST_SIGNAL.get(sym, "simons_ou")
+                best_sig_name = _best_signal.get(sym, "simons_ou")
                 if best_sig_name in ("simons", "simons_ou"):
                     gpu_gate_score = simons_ou
                 elif best_sig_name in ("poincare", "poincare_h1", "poincare_h4"):
