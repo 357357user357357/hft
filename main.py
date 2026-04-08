@@ -19,15 +19,15 @@ Usage:
 import argparse
 import logging
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 logger = logging.getLogger("hft")
 
 from hft_types import (
     Side, TakeProfitConfig, StopLossConfig, AutoPriceDown,
-    TradeResult, ExitReason, BacktestStats
+    TradeResult, ExitReason,
 )
 from data import load_agg_trades_csv, build_synthetic_book, AggTrade
 from algorithms.shot import ShotBacktest, ShotConfig
@@ -37,16 +37,16 @@ from config import load_config, save_current_config
 from slippage import SlippageModel, SlippageConfig
 from algorithms.averages import AveragesBacktest, AveragesConfig, AveragesCondition
 from algorithms.vector import VectorBacktest, VectorConfig, BorderRange, ShotDirection
-from risk_management import PositionSizer, SizingConfig
+from risk_management import PositionSizer
 from signal_gate import SignalGate, GateConfig
-from regime_detector import RegimeDetector, MarketRegime
+from regime_detector import RegimeDetector
 
 
 def parse_side(s: str) -> Side:
     return Side.Sell if s.lower() in ("sell", "short") else Side.Buy
 
 
-def collect_files(args) -> List[Path]:
+def collect_files(args: argparse.Namespace) -> List[Path]:
     if args.file:
         return [Path(args.file)]
 
@@ -400,7 +400,8 @@ def main() -> None:
         logger.info("%s", slippage.describe())
 
     # Initialize position sizer
-    from risk_management import PositionSizer, SizingConfig
+    from risk_management import SizingConfig
+
     position_sizer = PositionSizer(SizingConfig(
         mode=args.sizing_mode,
         fixed_size_usdt=C.DEFAULT_ORDER_SIZE_USDT,
@@ -472,15 +473,30 @@ def main() -> None:
     side = parse_side(args.side)
     algo = args.algo.lower()
 
-    runners = []
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Runner:
+        name: str
+        fn: Callable[..., None]
+        trades: List[AggTrade]
+        side: Side
+        slippage: SlippageModel
+        maker_fee: float
+        taker_fee: float
+        position_sizer: PositionSizer
+        signal_gate: Optional[SignalGate]
+        regime_detector: Optional[RegimeDetector]
+
+    runners: list[_Runner] = []
     if algo in ("shot", "all"):
-        runners.append(("Shot", run_shot, all_trades, side, slippage, args.maker_fee, args.taker_fee, position_sizer, signal_gate, regime_detector))
+        runners.append(_Runner("Shot", run_shot, all_trades, side, slippage, args.maker_fee, args.taker_fee, position_sizer, signal_gate, regime_detector))
     if algo in ("depth_shot", "all"):
-        runners.append(("DepthShot", run_depth_shot, all_trades, side, slippage, args.maker_fee, args.taker_fee, position_sizer, signal_gate, regime_detector))
+        runners.append(_Runner("DepthShot", run_depth_shot, all_trades, side, slippage, args.maker_fee, args.taker_fee, position_sizer, signal_gate, regime_detector))
     if algo in ("averages", "all"):
-        runners.append(("Averages", run_averages, all_trades, side, slippage, args.maker_fee, args.taker_fee, position_sizer, signal_gate, regime_detector))
+        runners.append(_Runner("Averages", run_averages, all_trades, side, slippage, args.maker_fee, args.taker_fee, position_sizer, signal_gate, regime_detector))
     if algo in ("vector", "all"):
-        runners.append(("Vector", run_vector, all_trades, side, slippage, args.maker_fee, args.taker_fee, position_sizer, signal_gate, regime_detector))
+        runners.append(_Runner("Vector", run_vector, all_trades, side, slippage, args.maker_fee, args.taker_fee, position_sizer, signal_gate, regime_detector))
 
     if args.parallel and len(runners) > 1:
         logger.info("Running %d algorithms in parallel ...", len(runners))
@@ -503,9 +519,9 @@ def main() -> None:
             ))
 
         with ThreadPoolExecutor(max_workers=len(runners)) as pool:
-            futures = {
-                pool.submit(fn, trades, s, make_slippage(), mf, tf, make_sizer(), signal_gate, regime_detector): name
-                for name, fn, trades, s, _slip, mf, tf, _ps in runners
+            futures: dict[Future[None], str] = {
+                pool.submit(r.fn, r.trades, r.side, make_slippage(), r.maker_fee, r.taker_fee, make_sizer(), r.signal_gate, r.regime_detector): r.name
+                for r in runners
             }
             for future in as_completed(futures):
                 name = futures[future]
@@ -514,8 +530,8 @@ def main() -> None:
                 except Exception as exc:
                     logger.error("%s raised: %s", name, exc)
     else:
-        for name, fn, trades, s, slip, mf, tf, ps, sg, rd in runners:
-            fn(trades, s, slip, mf, tf, ps, sg, rd)
+        for r in runners:
+            r.fn(r.trades, r.side, r.slippage, r.maker_fee, r.taker_fee, r.position_sizer, r.signal_gate, r.regime_detector)
 
 
 if __name__ == "__main__":

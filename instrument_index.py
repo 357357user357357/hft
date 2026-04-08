@@ -57,7 +57,7 @@ from whitehead_signal import whitehead_analysis
 from hecke_operators import HeckeAlgebra
 from frenet_serret import FrenetSerretAnalyzer, analyze_price_series as frenet_analyze, curvature_to_signal
 from polar_features import PolarExtractor, PolarSignalGenerator, describe_regime
-from p_adic import PAdicNumber, padic_from_integer
+from p_adic import padic_from_integer
 from spectral_window import spectral_report
 from hecke_operators import sieve_primes
 from fel_signal import FelSemigroupSignal, FelSignalConfig
@@ -396,47 +396,47 @@ assert abs(sum(_WEIGHTS.values()) - 1.0) < 1e-9, sum(_WEIGHTS.values())
 # Indexer helpers — GPU-first math functions (not part of InstrumentIndexer)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _groebner_inner(ret, xp):
+def _groebner_inner(ret: Any, xp: Any) -> float:
     """Groebner basis SVD elimination — shared by GPU(CuPy) and CPU(numpy)."""
     n = min(100, len(ret))
     ret_n = ret[:n]
-    d = 4
-    lag = int(n) - d
+    _d = 4
+    lag = int(n) - _d
     if lag < 10:
         return 0.0
-    X = xp.zeros((lag, d), dtype=xp.float64)
-    for j in range(d):
-        X[:, j] = ret_n[j:lag+j]
-    X = X - X.mean(axis=0)
-    norm = xp.sqrt((X**2).sum(axis=0)) + 1e-9
-    X = X / norm
-    U, S, Vt = xp.linalg.svd(X, full_matrices=False)
-    smallest_sv = float(S[-1])
+    _X = xp.zeros((lag, _d), dtype=xp.float64)
+    for j in range(_d):
+        _X[:, j] = ret_n[j:lag+j]
+    _X = _X - _X.mean(axis=0)
+    _norm = xp.sqrt((_X**2).sum(axis=0)) + 1e-9
+    _X = _X / _norm
+    _, _S, _Vt = xp.linalg.svd(_X, full_matrices=False)
+    smallest_sv = float(_S[-1])
     groebner_score = max(0.0, 1.0 - smallest_sv * 10)
-    if float(S[-2]) > 0:
-        direction = 1.0 if float(Vt[-1, 0]) > 0 else -1.0
+    if float(_S[-2]) > 0:
+        direction = 1.0 if float(_Vt[-1, 0]) > 0 else -1.0
     else:
         direction = 0.0
     return float(xp.clip(groebner_score * direction, -1, 1))
 
 
-def _dirichlet_inner(ret, xp):
+def _dirichlet_inner(ret: Any, xp: Any) -> float:
     """Dirichlet character periodicity detection — shared GPU/CPU."""
-    n = int(len(ret))
-    if n < 50:
+    n_local = int(len(ret))
+    if n_local < 50:
         return 0.0
-    ret = (ret - ret.mean()) / (ret.std() + 1e-9)
+    _ret = (ret - ret.mean()) / (ret.std() + 1e-9)
     best_val = 0.0
     for k in [3, 4, 5, 6, 7, 11]:
-        if n < k * 5:
+        if n_local < k * 5:
             continue
         vals = xp.real(xp.exp(2j * xp.pi * xp.arange(k, dtype=xp.float64) / k))
         # L(χ, s=0.5) proxy: weighted correlation
         l_val = 0.0
         w_sum = 0.0
-        for i in range(1, min(int(n), 100)):
+        for i in range(1, min(int(n_local), 100)):
             weight = float(i) ** (-0.5)
-            l_val += vals[i % k] * float(ret[i]) * weight
+            l_val += vals[i % k] * float(_ret[i]) * weight
             w_sum += weight
         if w_sum > 0:
             l_val /= w_sum
