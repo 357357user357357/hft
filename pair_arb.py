@@ -53,8 +53,7 @@ from typing import Deque, List, Optional, Tuple
 _RUST_PAIR = False
 _rust_mod = None
 try:
-    import ricci_rs as _rm
-    _rust_mod = _rm if hasattr(_rm, "kalman_pair_update") else getattr(_rm, "ricci_rs", None)
+    import hft_rs as _rust_mod
     if _rust_mod is not None and hasattr(_rust_mod, "kalman_pair_update"):
         _RUST_PAIR = True
 except Exception:

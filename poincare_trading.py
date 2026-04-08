@@ -52,11 +52,7 @@ except ImportError:
 # ricci_rs.ricci_flow(graph, D, steps, dt) runs the full flow in Rust.
 # Falls back to pure Python if the extension is not installed.
 try:
-    import ricci_rs as _ricci_rs
-    # maturin may install as a package with __init__.py re-exporting the .so,
-    # or the .so may be the top-level module — handle both layouts.
-    if not hasattr(_ricci_rs, 'all_edge_curvatures'):
-        _ricci_rs = _ricci_rs.ricci_rs  # unwrap nested module
+    import hft_rs as _ricci_rs
     _RUST_AVAILABLE = True
 except Exception:
     _RUST_AVAILABLE = False

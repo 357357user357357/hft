@@ -886,8 +886,8 @@ def _cpu_analyze_symbol(sym: str, prices: List[float], volumes: List[float]) -> 
     """
     # Fast path: Rust extension (~2ms vs ~110ms Python)
     try:
-        import analytics_rs
-        return analytics_rs.analyze_symbol(prices)
+        import hft_rs
+        return hft_rs.analyze_symbol(prices)
     except ImportError:
         pass
 

@@ -43,7 +43,8 @@ SIGNALS: List[Tuple[str, str]] = [
 # Stubbed (kept but not deployed):
 _STUBBED: List[Tuple[str, str]] = [
     ("order_flow", "Order Flow"),
-    ("hur
+    ("hurst", "Hurst"),
+]
 
 # Wider thresholds work better on 5-min bars
 THRESHOLDS = [0.40, 0.55, 0.70]
@@ -56,45 +57,22 @@ def _find_data_files(data_dir: Path, symbol: str) -> List[Path]:
 
 
 def _resample_gpu(prices_np, qtys_np, times_np, bar_seconds: int) -> Tuple[List[float], List[float]]:
-    """GPU-accelerated resampling via CuPy. Vectorized scatter ops."""
-    import cupy as cp
-
-    bar_ms = bar_seconds * 1000
-    prices_g = cp.asarray(prices_np, dtype=cp.float32)
-    qtys_g   = cp.asarray(qtys_np,   dtype=cp.float32)
-    times_g  = cp.asarray(times_np,  dtype=cp.int64)
-
-    t_start = int((times_g[0].item()  // bar_ms) * bar_ms)
-    t_last  = int((times_g[-1].item() // bar_ms) * bar_ms)
-    n_bars  = (t_last - t_start) // bar_ms + 1
-
-    bar_idx = cp.clip(((times_g - t_start) // bar_ms).astype(cp.int32), 0, n_bars - 1)
-
-    vol_g = cp.zeros(n_bars, dtype=cp.float32)
-    cp.add.at(vol_g, bar_idx, qtys_g)
-
-    order   = cp.argsort(bar_idx)   # preserves time order for equal bars
-    close_g = cp.zeros(n_bars, dtype=cp.float32)
-    close_g[bar_idx[order]] = prices_g[order]
-
-    close_np = close_g.get()
-    # Forward-fill empty bars
-    last = float(prices_np[0])
-    for i in range(len(close_np)):
-        if close_np[i] == 0.0:
-            close_np[i] = last
-        else:
-            last = close_np[i]
-
-    return close_np.tolist(), vol_g.get().tolist()
+    """GPU-accelerated resampling via hft_rs (Rust). Replaces CuPy scatter ops."""
+    import hft_rs
+    return hft_rs.resample_bars(
+        times_np.tolist(),
+        prices_np.tolist(),
+        qtys_np.tolist(),
+        bar_seconds,
+    )
 
 
 def _load_bars(zip_path: str, bar_seconds: int = 300) -> Tuple[List[float], List[float]]:
     """Load trades and resample to time-based bars.
 
     Priority:
-    1. Parquet file alongside zip (0.5s via pyarrow+CuPy — 4.7x faster)
-    2. Zip CSV with CuPy GPU resampling (2.2s)
+    1. Parquet file alongside zip (0.5s via pyarrow+hft_rs — 4.7x faster)
+    2. Zip CSV with hft_rs Rust resampling (2.2s)
     3. Pure CPU fallback (4.6s)
 
     Run convert_to_parquet.py to pre-convert all zip files to Parquet.

@@ -245,9 +245,8 @@ def _print_results(all_results: List[Tuple[str, str, dict]]) -> None:
 
     print(f"\n[Rust pair arb: ", end="")
     try:
-        import ricci_rs as _rm
-        mod = _rm if hasattr(_rm, "kalman_pair_update") else getattr(_rm, "ricci_rs", None)
-        ok  = mod is not None and hasattr(mod, "kalman_pair_update")
+        import hft_rs as _rm
+        ok = hasattr(_rm, "kalman_pair_update")
         print(f"{'YES — Kalman/Coint in Rust' if ok else 'not loaded'}]")
     except Exception:
         print("not available]")

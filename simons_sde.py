@@ -46,10 +46,9 @@ except Exception:
 # (~8x faster than the Python loops, which dominate Simons SDE profiling).
 _RUST_HMM = False
 try:
-    import ricci_rs as _ricci_rs_mod
-    _rust_mod = _ricci_rs_mod if hasattr(_ricci_rs_mod, 'hmm_regime_fit') else _ricci_rs_mod.ricci_rs
-    hmm_regime_fit_rs = _rust_mod.hmm_regime_fit
-    hmm_vol_fit_rs    = _rust_mod.hmm_vol_fit
+    import hft_rs
+    hmm_regime_fit_rs = hft_rs.hmm_regime_fit
+    hmm_vol_fit_rs    = hft_rs.hmm_vol_fit
     _RUST_HMM = True
 except Exception:
     _RUST_HMM = False
