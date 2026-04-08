@@ -66,7 +66,8 @@ def rolling_std(x: np.ndarray, w: int) -> np.ndarray:
     cc2 = np.cumsum(x ** 2, dtype=np.float64)
     mu = (cc1[w - 1:] - np.concatenate([[0], cc1[:-(w)]])) / w
     mu2 = (cc2[w - 1:] - np.concatenate([[0], cc2[:-(w)]])) / w
-    out[w - 1:] = np.sqrt(np.maximum(mu2 - mu ** 2, 0)).astype(np.float32)
+    var = np.maximum(mu2 - mu ** 2, 0)
+    out[w - 1:] = np.where(var > 0, np.sqrt(var), 0.0).astype(np.float32)
     return out
 
 
@@ -74,7 +75,10 @@ def zscore(x: np.ndarray, w: int) -> np.ndarray:
     """Rolling z-score: (x - rolling_mean) / rolling_std."""
     mu = rolling(x, w)
     sd = rolling_std(x, w)
-    return np.where(sd > 0, (x - mu) / sd, 0.0).astype(np.float32)
+    # Avoid 0/0 when both numerator and denominator are near-zero
+    with np.errstate(divide='ignore', invalid='ignore'):
+        z = (x - mu) / sd
+    return np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
 
 # ── Signal computations (pure numpy — fast, no GPU transfer overhead) ────────
@@ -124,8 +128,8 @@ def signal_momentum(prices: np.ndarray, window: int = 14) -> np.ndarray:
     losses[ret < 0] = -ret[ret < 0]
     avg_gain = np.convolve(gains, np.ones(window) / window, mode="valid")
     avg_loss = np.convolve(losses, np.ones(window) / window, mode="valid")
-    rs = avg_gain / (np.abs(avg_loss) + 1e-9)
-    rsi = 1.0 / (1.0 + 1.0 / np.abs(rs))
+    rs = avg_gain / np.clip(np.abs(avg_loss), 1e-9, None)
+    rsi = 1.0 / (1.0 + 1.0 / np.clip(np.abs(rs), 1e-9, None))
     rsi_norm = (rsi - 0.5) * 2.0  # center to [-1, 1]
     out[window - 1 + len(rsi_norm):] = 0  # safety
     offset = window - 1
@@ -157,6 +161,121 @@ def signal_ou(prices: np.ndarray, windows=None) -> np.ndarray:
         z = zscore(ret, w)
         all_z[i] = z
     out[1:] = all_z.mean(axis=0)
+    return out
+
+
+def signal_curvature(prices: np.ndarray, delay: int = 5) -> np.ndarray:
+    """Frenet-Serret curvature of 2D price embedding (price, delayed_price).
+
+    High curvature → mean-reversion regime (price path bends back on itself).
+    Low curvature → trending regime (price path is straight).
+    """
+    N = len(prices)
+    out = np.zeros(N, dtype=np.float64)
+    x = prices.astype(np.float64)
+    y = np.zeros_like(x)
+    y[delay:] = prices[:-delay]
+    # First derivatives via central differences
+    xp = np.zeros_like(x)
+    yp = np.zeros_like(y)
+    xp[1:-1] = (x[2:] - x[:-2]) / 2.0
+    yp[1:-1] = (y[2:] - y[:-2]) / 2.0
+    # Second derivatives
+    xpp = np.zeros_like(x)
+    ypp = np.zeros_like(y)
+    xpp[1:-1] = x[2:] - 2.0 * x[1:-1] + x[:-2]
+    ypp[1:-1] = y[2:] - 2.0 * y[1:-1] + y[:-2]
+    # 2D curvature: |x'y'' - y'x''| / (x'² + y'²)^(3/2)
+    cross = np.abs(xp * ypp - yp * xpp)
+    speed = (xp**2 + yp**2) ** 1.5
+    safe_speed = np.maximum(speed, 1e-15)
+    kappa = cross / safe_speed
+    # Mask zero-speed edges
+    kappa = np.where(speed > 1e-15, kappa, 0.0)
+    # Invert so positive = trending-friendly (low curvature)
+    # Center around median for signal interpretation
+    valid = kappa[kappa > 0]
+    if len(valid) > 0:
+        median_k = np.median(valid)
+        out = (median_k - kappa).astype(np.float32)  # flip: trending → positive
+    else:
+        out = np.zeros(N, dtype=np.float32)
+    return out
+
+
+def signal_polar(prices: np.ndarray, tau: int = 14) -> np.ndarray:
+    """Phase-space polar signal: radial expansion / contraction.
+
+    Embeds price in (p, p-p_delay) phase space. Radial growth = momentum
+    building, contraction = momentum decaying / reversal likely.
+    """
+    N = len(prices)
+    scale = float(np.mean(prices[:max(1, min(20, N))])) + 1e-9
+    x = prices.astype(np.float64) / scale
+    y = np.zeros(N, dtype=np.float64)
+    y[tau:] = (prices[tau:] - prices[:-tau]).astype(np.float64) / scale
+    r = np.sqrt(x**2 + y**2)
+    # dr/dt as signal: positive = expanding (momentum building)
+    dr = np.zeros(N, dtype=np.float32)
+    dr[1:] = np.diff(r).astype(np.float32)
+    # Normalize by mean radius for scale invariance
+    mean_r = np.mean(r[r > 0]) + 1e-9
+    return dr / float(mean_r)
+
+
+def signal_quaternion(prices: np.ndarray) -> np.ndarray:
+    """Quaternion state reversibility angle.
+
+    Builds a 4D state (return, momentum, acceleration, vol_proxy) and
+    computes the angle between the state and its conjugate. High angle
+    = state is far from reversible = continuation likely.
+    """
+    N = len(prices)
+    ret = np.zeros(N, dtype=np.float64)
+    ret[1:] = (prices[1:] - prices[:-1]) / (np.abs(prices[:-1]) + 1e-9)
+    mom = np.diff(ret, prepend=ret[0])
+    acc = np.diff(mom, prepend=mom[0])
+    vol_proxy = np.abs(ret)
+    # Angle between q=(w,x,y,z) and q*=(w,-x,-y,-z)
+    num = ret**2 - mom**2 - acc**2 - vol_proxy**2
+    den = ret**2 + mom**2 + acc**2 + vol_proxy**2
+    safe_den = np.maximum(den, 1e-15)
+    cos_angle = num / safe_den
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+    angle = np.arccos(cos_angle) / np.pi  # normalize to [0, 1]
+    # Center to [-1, 1]: angle > 0.5 → continuation, < 0.5 → reversal
+    return (angle - 0.5).astype(np.float32) * 2.0
+
+
+def signal_spectral(prices: np.ndarray, window: int = 50) -> np.ndarray:
+    """Multi-scale spectral strength via prime-lag autocorrelation.
+
+    Aggregates autocorrelation at prime lags (2,3,5,7,11) to capture
+    periodicity at different horizons that single-lag autocorr misses.
+    """
+    primes = [2, 3, 5, 7, 11]
+    N = len(prices)
+    ret = np.zeros(N, dtype=np.float32)
+    ret[1:] = (prices[1:] - prices[:-1]) / (np.abs(prices[:-1]) + 1e-9)
+    out = np.zeros(N, dtype=np.float32)
+    for i in range(window, N):
+        chunk = ret[i - window:i]
+        mu = chunk.mean()
+        var = chunk.var()
+        if var < 1e-15:
+            continue
+        ac_sum = 0.0
+        n_used = 0
+        for p in primes:
+            if p >= len(chunk):
+                continue
+            r1, r2 = chunk[p:], chunk[:-p]
+            cov = ((r1 - mu) * (r2 - mu)).mean() / var
+            ac_sum += cov
+            n_used += 1
+        if n_used > 0:
+            out[i] = float(np.clip(ac_sum / n_used, -1.0, 1.0))
     return out
 
 
@@ -244,19 +363,19 @@ def load_symbol(data_dir: Path, symbol: str, bar_seconds: int = 300
     if not _load_parquet_available:
         from data import load_agg_trades_csv, resample_to_bars
         prices, vols = [], []
-        for f in sorted(data_dir.glob(f"{symbol}-aggTrades-*.zip")):
+        for f in sorted(data_dir.glob(f"**/{symbol}-aggTrades-*.zip")):
             trades = load_agg_trades_csv(str(f))
             p, v = resample_to_bars(trades, bar_seconds=bar_seconds)
             prices.extend(p); vols.extend(v)
         return np.array(prices, dtype="float32"), np.array(vols, dtype="float32")
 
     import pyarrow.parquet as pq
-    files = sorted(data_dir.glob(f"{symbol}-aggTrades-*.parquet"))
+    files = sorted(data_dir.glob(f"**/{symbol}-aggTrades-*.parquet"))
     if not files:
         # fallback to zip
         from data import load_agg_trades_csv, resample_to_bars
         prices, vols = [], []
-        for f in sorted(data_dir.glob(f"{symbol}-aggTrades-*.zip")):
+        for f in sorted(data_dir.glob(f"**/{symbol}-aggTrades-*.zip")):
             trades = load_agg_trades_csv(str(f))
             p, v = resample_to_bars(trades, bar_seconds=bar_seconds)
             prices.extend(p); vols.extend(v)
@@ -323,19 +442,26 @@ def walk_forward_one_symbol(symbol: str, prices: np.ndarray,
     ret[1:] = (prices[1:] - prices[:-1]) / (np.abs(prices[:-1]) + 1e-9)
 
     # Pre-compute all signals (CPU numpy, fast enough for single series)
-    # Signal returns: (signal_vec_np of length T)
     sig_mom    = signal_momentum(prices)
     sig_ou     = signal_ou(prices)
     sig_vol    = signal_volatility(prices)
+    sig_ac     = signal_autocorr_series(ret, window=50, lag=1)
 
-    # Autocorr (vectorized) — use lag-1 on rolling 50-bar windows
-    sig_ac   = signal_autocorr_series(ret, window=50, lag=1)
+    # New GPU-compatible math signals
+    sig_curv   = signal_curvature(prices)
+    sig_polar  = signal_polar(prices)
+    sig_quat   = signal_quaternion(prices)
+    sig_spect  = signal_spectral(prices)
 
     all_sig = {
         "momentum":       sig_mom,
         "simons_ou":      sig_ou,
         "volatility":     sig_vol,
         "autocorrelation": sig_ac,
+        "curvature":      sig_curv,
+        "polar":          sig_polar,
+        "quaternion":     sig_quat,
+        "spectral":       sig_spect,
     }
 
     # Pre-compute simple MA signals
@@ -460,7 +586,7 @@ def main() -> None:
     print(f"  Train: {args.train_days} days  |  Test: {args.test_days} days  |  Bar: {args.bar_size}s")
 
     symbols = args.symbol or sorted(s.name.split("-aggTrades-")[0]
-                                     for s in data_dir.glob("*-aggTrades-*.parquet"))
+                                     for s in data_dir.glob("**/*-aggTrades-*.parquet"))
     if not symbols:
         print("No symbols found.")
         sys.exit(1)

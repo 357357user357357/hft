@@ -377,6 +377,13 @@ def _render(states: List["LiveState"], live_mode: bool, client: Optional[BybitCl
     print(f"{_BOLD}{'─'*70}{_RESET}")
     print(f"  equity={equity:.2f} USDT  trades={total_trades}  win={win_rate:.1f}%  "
           f"daily={_pnl_col(daily_pnl)}{daily_pnl:+.3f}%{_RESET}")
+
+    # Walk-forward signal summary panel
+    wf_lines = _render_wf_panel()
+    if wf_lines:
+        print(f"\n{_BOLD}{'─'*70}{_RESET}")
+        print(wf_lines)
+
     print()
 
     for st in states:
@@ -418,13 +425,79 @@ def _render(states: List["LiveState"], live_mode: bool, client: Optional[BybitCl
                 p  = gsig.get("poincare",  0.0)
                 so = gsig.get("simons_ou", 0.0)
                 hk = gsig.get("hecke",     0.0)
+                cr = gsig.get("curvature", 0.0)
+                pl = gsig.get("polar",      0.0)
                 best_name = _best_signal.get(st.symbol, "?")
                 # Highlight the active signal
-                gpu_sig_str = f"  {_DIM}P={p:+.2f} OU={so:+.2f} Hk={hk:+.2f}{_RESET}  {_BOLD}->{best_name}{_RESET}"
+                gpu_sig_str = (f"  {_DIM}P={p:+.2f} OU={so:+.2f} Hk={hk:+.2f}"
+                               f" Cv={cr:+.2f} Pl={pl:+.2f}{_RESET}"
+                               f"  {_BOLD}->{best_name}{_RESET}")
         print(f"  {st.symbol:<12} {price_str}  {pos_str}{spread_str}{cpu_str}{gpu_sig_str}")
 
     print(f"\n{_BOLD}{'─'*70}{_RESET}")
     print(f"  {_DIM}Ctrl+C to stop{_RESET}", flush=True)
+
+
+# ── Walk-forward results panel (rendered from gpu_wf_results.json) ────────────
+_wf_cache: Optional[List[str]] = None
+_wf_cache_ts: float = 0.0
+
+def _render_wf_panel() -> Optional[str]:
+    """Render walk-forward signal ranking from gpu_wf_results.json."""
+    global _wf_cache, _wf_cache_ts
+    now = time.monotonic()
+    if now - _wf_cache_ts < 60.0 and _wf_cache is not None:
+        return "\n".join(_wf_cache) if _wf_cache else None
+
+    wf_path = os.path.join(os.path.dirname(__file__), "gpu_wf_results.json")
+    if not os.path.exists(wf_path):
+        _wf_cache = None
+        return None
+
+    try:
+        with open(wf_path) as f:
+            data = json.load(f)
+
+        summary = data.get("summary", {})
+        if not summary:
+            _wf_cache = None
+            return None
+
+        lines = [f"{_BOLD}  WALK-FORWARD SIGNALS{_RESET}"]
+        lines.append(f"  {'Signal':<18} {'OOS Sharpe':>10}  {'PnL':>8}  "
+                      f"{'Win%':>6}  {'Folds':>5}")
+        lines.append(f"  {'─'*58}")
+
+        ranked = sorted(summary.items(),
+                        key=lambda x: x[1].get("avg_oos_sharpe", 0),
+                        reverse=True)
+        for sig_name, stats in ranked:
+            sh = stats.get("avg_oos_sharpe", 0)
+            pnl = stats.get("avg_oos_pnl", 0)
+            wr = stats.get("avg_winrate", 0) * 100
+            nf = stats.get("folds", 0)
+            clr = _GREEN if sh > 0 else _RED
+            lines.append(f"  {sig_name:<18} {clr}{sh:+>10.2f}{_RESET}  "
+                          f"{_pnl_col(pnl)}{pnl:+7.2f}%{_RESET}  "
+                          f"{wr:>5.1f}%  {nf:>5}")
+
+        # Best per-symbol
+        best = data.get("best_per_symbol", {})
+        if best:
+            lines.append("")
+            lines.append(f"  {_BOLD}Best per symbol:{_RESET}")
+            for sym, info in sorted(best.items()):
+                sig = info.get("signal", "?")
+                sh = info.get("avg_oos_sharpe", 0)
+                clr = _GREEN if sh > 0 else _RED
+                lines.append(f"  {_DIM}{sym:<10} → {sig:<16} {clr}{sh:+.2f}{_RESET}")
+
+        _wf_cache = lines
+        _wf_cache_ts = now
+        return "\n".join(lines)
+    except Exception:
+        _wf_cache = None
+        return None
 
 
 # ── Correlation groups (avoid stacking correlated positions) ─────────────────
@@ -504,6 +577,8 @@ def _load_wf_results() -> None:
                     "simons_ou": "simons_ou", "volatility": "volatility",
                     "momentum": "zscore", "autocorrelation": "autocorr",
                     "poincare": "poincare", "hecke": "hecke",
+                    "curvature": "curvature", "polar": "polar",
+                    "quaternion": "quaternion", "spectral": "spectral",
                 }.get(sig_name, "simons_ou")
                 _best_signal[sym] = gpu_key
     except Exception as e:
@@ -580,7 +655,7 @@ def _get_signal_score(symbol: str, prices: List[float], volumes: List[float],
         except Exception:
             return 0.0
 
-    # Standard signals (momentum, simons, volatility, etc.)
+    # Standard signals (momentum, simons, volatility, curvature, polar, quaternion, spectral, etc.)
     try:
         if _indexer_instance is None:
             from instrument_index import InstrumentIndexer
